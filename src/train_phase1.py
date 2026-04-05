@@ -215,6 +215,7 @@ def train_phase1(
     grad_checkpoint: bool  = False,
     label_smoothing: float = 0.1,   # prevents over-confident logits; paper trains with smoothing via Mixup
     warmup_pct:      float = 0.05,  # fraction of steps used for LR warmup; paper uses ~2/50 = 0.04
+    min_lr:          float = 0.0,   # cosine annealing lower bound (eta_min)
     compile_model:   bool  = False,  # torch.compile: 2-3x throughput on CUDA (PyTorch >= 2.0)
     extra_config:    dict  = {},
 ) -> CoarseClassifier:
@@ -239,19 +240,30 @@ def train_phase1(
         weight_decay = weight_decay,
     )
 
-    # OneCycleLR steps once per optimizer update, not per data batch.
+    # Linear warmup then cosine annealing, both stepped once per optimizer update.
     # With gradient accumulation the number of optimizer steps per epoch is
     # len(loader) // accum_steps, so the LR curve is correct regardless of accum_steps.
     # warmup_pct=0.05 ≈ 2.5 epochs at default 50 epochs, matching the paper's 2-epoch warmup.
-    # The original hardcoded 0.3 gave 15 warmup epochs — wasteful and slowed convergence.
     opt_steps_per_epoch = max(1, len(train_loader) // accum_steps)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    total_steps   = opt_steps_per_epoch * epochs
+    warmup_steps  = max(1, round(total_steps * warmup_pct))
+    cosine_steps  = max(1, total_steps - warmup_steps)
+
+    warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        max_lr          = lr,
-        steps_per_epoch = opt_steps_per_epoch,
-        epochs          = epochs,
-        pct_start       = warmup_pct,
-        anneal_strategy = "cos",
+        start_factor = 1e-4,        # ramp from lr*1e-4 → lr over warmup_steps
+        end_factor   = 1.0,
+        total_iters  = warmup_steps,
+    )
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max   = cosine_steps,
+        eta_min = min_lr,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers = [warmup_sched, cosine_sched],
+        milestones = [warmup_steps],
     )
 
     if resume:
@@ -295,8 +307,9 @@ def train_phase1(
                 "betas":           [0.9, 0.999],
                 "label_smoothing": label_smoothing,
                 "warmup_pct":      warmup_pct,
+                "min_lr":          min_lr,
                 "optimizer":       "AdamW",
-                "scheduler":       "OneCycleLR",
+                "scheduler":       "LinearWarmup+CosineAnnealing",
                 "amp":             scaler is not None,
                 "compile":         compile_model,
                 "grad_checkpoint": grad_checkpoint,
@@ -424,6 +437,8 @@ if __name__ == "__main__":
                         help="Cross-entropy label smoothing (default: 0.1; 0 to disable)")
     parser.add_argument("--warmup-pct",    type=float, default=0.05,
                         help="Fraction of steps used for LR warmup (default: 0.05 ≈ 2.5 epochs at 50)")
+    parser.add_argument("--min-lr",        type=float, default=0.0,
+                        help="Cosine annealing lower bound eta_min (default: 0.0)")
     parser.add_argument("--compile",       action="store_true",
                         help="torch.compile the model for 2-3x CUDA throughput (PyTorch >= 2.0)")
     parser.add_argument("--lazy",          action="store_true",
@@ -522,6 +537,7 @@ if __name__ == "__main__":
         weight_decay     = args.weight_decay,
         label_smoothing  = args.label_smoothing,
         warmup_pct       = args.warmup_pct,
+        min_lr           = args.min_lr,
         compile_model    = args.compile,
         accum_steps      = args.grad_accum,
         grad_checkpoint  = args.grad_checkpoint,

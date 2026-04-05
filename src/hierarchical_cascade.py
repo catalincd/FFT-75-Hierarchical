@@ -122,9 +122,25 @@ class ResConvBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Attention pooling — replaces GAP; learns which positions are discriminative
+# ---------------------------------------------------------------------------
+
+class AttentionPool1d(nn.Module):
+    """Learns which spatial positions are discriminative before collapsing."""
+    def __init__(self, d: int):
+        super().__init__()
+        self.attn = nn.Linear(d, 1, bias=False)  # scalar score per position
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, d, L)
+        w = torch.softmax(self.attn(x.permute(0, 2, 1)), dim=1)  # (B, L, 1)
+        return (x.permute(0, 2, 1) * w).sum(dim=1)               # (B, d)
+
+
+# ---------------------------------------------------------------------------
 # Shared Byte Encoder — ByteResNet backbone (2024 SOTA on FFT-75)
 # Input: (B, L) raw bytes  ->  Output: (B, out_dim) feature vector
-# Works for any sector length L (512 or 4096 bytes) via AdaptiveAvgPool1d.
+# Works for any sector length L (512 or 4096 bytes) via AttentionPool1d.
 # ---------------------------------------------------------------------------
 
 class ByteEncoder(nn.Module):
@@ -135,7 +151,7 @@ class ByteEncoder(nn.Module):
       - Residual connections prevent gradient vanishing in deeper stacks
       - SE channel attention recalibrates feature maps after each residual block
       - GELU activations + BatchNorm for faster, more stable convergence
-      - 4-stage progressive downsampling; AdaptiveAvgPool1d handles 512 or 4096 bytes
+      - 5-stage progressive downsampling; AttentionPool1d handles 512 or 4096 bytes
       - Larger embedding dim (16 vs 8) encodes richer byte co-occurrence patterns
     """
     def __init__(self, embed_dim: int = 16, num_filters: int = 128,
@@ -168,9 +184,16 @@ class ByteEncoder(nn.Module):
             ResConvBlock(F*2, F*4, kernel_size=3),
             ResConvBlock(F*4, F*4, kernel_size=3),
         )
+        self.pool3  = nn.MaxPool1d(4)                       # L/16 -> L/64
 
-        self.gap     = nn.AdaptiveAvgPool1d(1)              # any length -> 1
-        self.out_dim = F * 4                                # 512
+        # Stage 4: two blocks at 8x width, high-level semantic features
+        self.stage4 = nn.Sequential(
+            ResConvBlock(F*4, F*8, kernel_size=3),
+            ResConvBlock(F*8, F*8, kernel_size=3),
+        )
+
+        self.pool    = AttentionPool1d(F * 8)               # weighted spatial collapse
+        self.out_dim = F * 8                                # 1024
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, L) int64 byte values
@@ -181,12 +204,99 @@ class ByteEncoder(nn.Module):
             # Cuts activation memory by ~60% at the cost of one extra forward pass.
             x = self.pool1(grad_ckpt(self.stage1, x, use_reentrant=False))
             x = self.pool2(grad_ckpt(self.stage2, x, use_reentrant=False))
-            x = grad_ckpt(self.stage3, x, use_reentrant=False)
+            x = self.pool3(grad_ckpt(self.stage3, x, use_reentrant=False))
+            x = grad_ckpt(self.stage4, x, use_reentrant=False)
         else:
             x = self.pool1(self.stage1(x))
             x = self.pool2(self.stage2(x))
-            x = self.stage3(x)
-        return self.gap(x).squeeze(-1)                      # (B, out_dim)
+            x = self.pool3(self.stage3(x))
+            x = self.stage4(x)
+        return self.pool(x)                                 # (B, out_dim)
+
+
+# ---------------------------------------------------------------------------
+# Bigram branch — global byte co-occurrence statistics
+# ---------------------------------------------------------------------------
+
+def build_bigram(x: torch.Tensor) -> torch.Tensor:
+    """
+    Loop-free 256×256 bigram matrix from raw byte sequence.
+
+    For L bytes there are L-1 consecutive pairs. Each pair (a, b) increments
+    mat[a*256+b]. The result is normalised by (L-1) so inputs of different
+    lengths produce comparable distributions.
+
+    Returns: (B, 1, 256, 256) float32, ready for Conv2d.
+    """
+    B, L = x.shape
+    idx = x[:, :-1].long() * 256 + x[:, 1:].long()          # (B, L-1)
+    mat = torch.zeros(B, 256 * 256, device=x.device, dtype=torch.float32)
+    mat.scatter_add_(1, idx, torch.ones_like(idx, dtype=torch.float32))
+    return (mat / (L - 1)).reshape(B, 1, 256, 256)
+
+
+class BigramBranch(nn.Module):
+    """
+    256×256 byte co-occurrence matrix → compact feature vector.
+
+    Motivation: the CNN backbone must build up receptive field through pooling
+    layers to capture long-range byte relationships.  The bigram matrix is a
+    global statistic by construction — every byte pair contributes regardless
+    of position — so it completely bypasses the receptive-field problem and is
+    particularly valuable for 4096-byte sectors where distant pairs are common.
+
+    Architecture: treat the 256×256 matrix as a 1-channel "image", two conv
+    stages reduce it to a 64-d global vector, then project to out_dim.
+    """
+    def __init__(self, out_dim: int = 512):
+        super().__init__()
+        self.out_dim = out_dim
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1), nn.GELU(),
+            nn.MaxPool2d(4),                              # → (32, 64, 64)
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),                      # → (64, 1, 1)
+            nn.Flatten(),
+            nn.Linear(64, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L) int64 byte values
+        return self.net(build_bigram(x))                    # (B, out_dim)
+
+
+# ---------------------------------------------------------------------------
+# Fused encoder — CNN branch + bigram branch, same interface as ByteEncoder
+# ---------------------------------------------------------------------------
+
+class FusedEncoder(nn.Module):
+    """
+    Concatenates ByteEncoder (sequential CNN) and BigramBranch (global stats).
+
+    Exposes the same `.out_dim` / `forward(x)` interface as ByteEncoder so
+    CoarseClassifier, SpecialistClassifier, and HierarchicalCascade require
+    no changes beyond instantiating FusedEncoder instead of ByteEncoder.
+
+    Default dims: ByteEncoder(F=128) → 1024, BigramBranch → 512, total 1536.
+    """
+    def __init__(
+        self,
+        embed_dim:       int  = 16,
+        num_filters:     int  = 128,
+        bigram_dim:      int  = 512,
+        grad_checkpoint: bool = False,
+    ):
+        super().__init__()
+        self.byte_enc   = ByteEncoder(embed_dim, num_filters, grad_checkpoint)
+        self.bigram_enc = BigramBranch(out_dim=bigram_dim)
+        self.out_dim    = self.byte_enc.out_dim + bigram_dim  # 1536
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L) int64 byte values
+        cnn_feat    = self.byte_enc(x)                       # (B, 1024)
+        bigram_feat = self.bigram_enc(x)                     # (B, 512)
+        return torch.cat([cnn_feat, bigram_feat], dim=-1)    # (B, 1536)
+
 
 # ---------------------------------------------------------------------------
 # Stage 1: Coarse Group Classifier
@@ -209,7 +319,7 @@ class CoarseClassifier(nn.Module):
     def __init__(self, encoder: ByteEncoder):
         super().__init__()
         self.encoder = encoder
-        d      = encoder.out_dim          # 512
+        d      = encoder.out_dim          # 1536 with FusedEncoder (1024 CNN + 512 bigram)
         hidden = d // 2                   # 256
 
         self.norm       = nn.LayerNorm(d)
@@ -265,16 +375,16 @@ class HierarchicalCascade(nn.Module):
         super().__init__()
 
         if shared_encoder:
-            encoder = ByteEncoder()
+            encoder = FusedEncoder()
             self.coarse = CoarseClassifier(encoder)
             self.specialists = nn.ModuleDict({
                 group: SpecialistClassifier(encoder, len(types))
                 for group, types in GROUPS.items()
             })
         else:
-            self.coarse = CoarseClassifier(ByteEncoder())
+            self.coarse = CoarseClassifier(FusedEncoder())
             self.specialists = nn.ModuleDict({
-                group: SpecialistClassifier(ByteEncoder(), len(types))
+                group: SpecialistClassifier(FusedEncoder(), len(types))
                 for group, types in GROUPS.items()
             })
 
