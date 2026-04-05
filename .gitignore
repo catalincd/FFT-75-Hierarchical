@@ -1,0 +1,41 @@
+# Data — too large for git; download via scripts/download_data.sh
+data/
+
+# Model checkpoints — store on HuggingFace Hub; upload via scripts/upload_model.sh
+checkpoints/
+src/phase1_archive/
+src/cascade_archive/
+archive/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# LaTeX build artifacts
+latex/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
