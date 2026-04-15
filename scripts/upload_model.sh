@@ -4,7 +4,7 @@
 # Usage (from repo root, on the vast.ai instance after training):
 #   bash scripts/upload_model.sh YOUR_HF_USERNAME [CHECKPOINT_DIR]
 #
-# CHECKPOINT_DIR defaults to src/phase1_archive/ (where train_phase1.py saves).
+# CHECKPOINT_DIR defaults to checkpoints/phase1_archive/ (where train_phase1.sh saves).
 # Set HF_TOKEN env var or run `huggingface-cli login` first.
 
 set -euo pipefail
@@ -13,7 +13,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 HF_USER="${1:-}"
-CKPT_DIR="${2:-src/phase1_archive}"
+CKPT_DIR="${2:-checkpoints/phase1_archive}"
 
 if [[ -z "$HF_USER" ]]; then
   echo "Usage: bash scripts/upload_model.sh YOUR_HF_USERNAME [CHECKPOINT_DIR]"
