@@ -62,6 +62,7 @@ from hierarchical_cascade import (
     GROUP_LOCAL_IDX,
     GROUPS,
     GROUP_NAMES,
+    make_optimizer,
 )
 
 # ---------------------------------------------------------------------------
@@ -200,7 +201,7 @@ def train_one_epoch(
         pbar.set_postfix(
             loss=f"{running_loss / step:.4f}",
             acc=f"{total_correct / total_samples:.3f}",
-            lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            lr=f"{optimizer.param_groups[-1]['lr']:.2e}",
             refresh=False,
         )
         pbar.update(1)
@@ -307,17 +308,19 @@ def train_specialist(
     if encoder_init == "frozen":
         for p in model.encoder.parameters():
             p.requires_grad_(False)
-        trainable_params = list(model.head.parameters())
         print(f"  [{group}] encoder frozen — training head only")
-    else:
-        trainable_params = list(model.parameters())
 
-    scaler    = torch.amp.GradScaler("cuda") if device.startswith("cuda") else None
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr           = lr,
-        betas        = (0.9, 0.999),
-        weight_decay = weight_decay,
+    scaler = torch.amp.GradScaler("cuda") if device.startswith("cuda") else None
+
+    # encoder_lr_scale=0.1: pretrained encoder updates at lr/10 so it doesn't
+    # drift too fast while the randomly-initialised head catches up.
+    # Has no effect when encoder is frozen (those params have requires_grad=False).
+    encoder_lr_scale = 0.1 if encoder_init != "frozen" else 1.0
+    optimizer = make_optimizer(
+        model,
+        lr               = lr,
+        weight_decay     = weight_decay,
+        encoder_lr_scale = encoder_lr_scale,
     )
 
     opt_steps_per_epoch = max(1, len(train_loader) // accum_steps)
@@ -385,6 +388,7 @@ def train_specialist(
                 "optimizer":       "AdamW",
                 "scheduler":       "LinearWarmup+CosineAnnealing",
                 "encoder_init":    encoder_init,
+                "encoder_lr_scale": encoder_lr_scale,
                 "amp":             scaler is not None,
                 "compile":         compile_model,
                 "grad_checkpoint": grad_checkpoint,
@@ -447,7 +451,7 @@ def train_specialist(
             "train_acc":  round(train_acc,  6),
             "val_loss":   round(val_loss,   6),
             "val_acc":    round(val_acc,    6),
-            "lr":         round(optimizer.param_groups[0]["lr"], 8),
+            "lr":         round(optimizer.param_groups[-1]["lr"], 8),
             "elapsed_s":  round(elapsed, 2),
             "timestamp":  datetime.now().isoformat(),
             "checkpoint": ckpt_path.name,

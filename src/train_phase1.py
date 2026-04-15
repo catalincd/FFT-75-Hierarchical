@@ -42,6 +42,7 @@ from hierarchical_cascade import (
     GROUP_TO_IDX,
     GROUP_NAMES,
     NUM_GROUPS,
+    make_optimizer,
 )
 
 # ---------------------------------------------------------------------------
@@ -158,7 +159,7 @@ def train_one_epoch(
         pbar.set_postfix(
             loss=f"{running_loss / step:.4f}",
             acc=f"{total_correct / total_samples:.3f}",
-            lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            lr=f"{optimizer.param_groups[-1]['lr']:.2e}",
             refresh=False,
         )
         pbar.update(1)
@@ -233,10 +234,11 @@ def train_phase1(
     # AdamW: decoupled weight decay matches the paper exactly (β₁=0.9, β₂=0.999).
     # Adam (without W) conflates weight decay with L2 regularisation, which interacts
     # poorly with adaptive gradient scaling. AdamW fixes this and is the right choice.
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    # make_optimizer excludes embeddings, BN, LN, and biases from weight decay — the
+    # byte embedding table in particular must not be decayed (collapses toward zero).
+    optimizer = make_optimizer(
+        model,
         lr           = lr,
-        betas        = (0.9, 0.999),  # paper values; explicit so ablations are clear
         weight_decay = weight_decay,
     )
 
@@ -380,7 +382,7 @@ def train_phase1(
             "train_acc":  round(train_acc,  6),
             "val_loss":   round(val_loss,   6),
             "val_acc":    round(val_acc,    6),
-            "lr":         round(optimizer.param_groups[0]["lr"], 8),
+            "lr":         round(optimizer.param_groups[-1]["lr"], 8),
             "elapsed_s":  round(elapsed, 2),
             "timestamp":  datetime.now().isoformat(),
             "checkpoint": ckpt_path.name,

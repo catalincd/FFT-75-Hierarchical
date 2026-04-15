@@ -343,19 +343,95 @@ class CoarseClassifier(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SpecialistClassifier(nn.Module):
-    """Predicts the fine-grained type within a single group."""
+    """
+    Predicts the fine-grained type within a single group.
+
+    Head matches CoarseClassifier quality: LayerNorm → Linear → GELU →
+    Dropout → residual skip → LayerNorm → head.  The original Sequential
+    (Linear → ReLU → Dropout → Linear) had no input normalisation and no
+    skip path, which made it harder to train when the encoder is pretrained
+    and the head is randomly initialised.
+    """
     def __init__(self, encoder: ByteEncoder, num_classes: int):
         super().__init__()
-        self.encoder = encoder
-        self.head = nn.Sequential(
-            nn.Linear(encoder.out_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes),
-        )
+        self.encoder  = encoder
+        d             = encoder.out_dim
+        hidden        = d // 4              # 384 for FusedEncoder (1536 // 4)
+        self.norm     = nn.LayerNorm(d)
+        self.fc1      = nn.Linear(d, hidden, bias=False)
+        self.drop     = nn.Dropout(0.3)
+        self.skip     = nn.Linear(d, hidden, bias=False)
+        self.out_norm = nn.LayerNorm(hidden)
+        self.head     = nn.Linear(hidden, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.encoder(x))                   # (B, num_classes)
+        feat = self.norm(self.encoder(x))                   # (B, d)
+        h    = self.drop(F.gelu(self.fc1(feat))) + self.skip(feat)  # (B, hidden)
+        return self.head(self.out_norm(h))                  # (B, num_classes)
+
+
+# ---------------------------------------------------------------------------
+# Optimizer factory — correct AdamW parameter grouping
+# ---------------------------------------------------------------------------
+
+def make_optimizer(
+    model: nn.Module,
+    lr: float,
+    weight_decay: float,
+    betas: tuple[float, float] = (0.9, 0.999),
+    encoder_lr_scale: float = 1.0,
+) -> torch.optim.AdamW:
+    """
+    AdamW with two correctness fixes applied:
+
+    1.  No weight decay on embeddings, BatchNorm, LayerNorm, or biases.
+        Decaying the byte embedding table collapses vectors toward zero and
+        degrades the learned byte co-occurrence representation.  BN/LN
+        scale+shift parameters are unit-scale priors — decaying them fights
+        the normalisation layer's own purpose.
+
+    2.  Optional lower LR for the encoder (encoder_lr_scale < 1.0).
+        When the encoder is warm-started from phase1 and the head is randomly
+        initialised, using the same LR for both causes the encoder to drift
+        too fast (catastrophic forgetting) while the head barely converges.
+        Typical value: 0.1 (encoder updates at lr/10, head at lr).
+    """
+    # Collect parameter ids that belong to no-decay module types
+    no_decay_types = (nn.Embedding, nn.BatchNorm1d, nn.LayerNorm)
+    no_decay_ids: set[int] = set()
+    for mod in model.modules():
+        if isinstance(mod, no_decay_types):
+            for p in mod.parameters(recurse=False):
+                no_decay_ids.add(id(p))
+
+    has_encoder = hasattr(model, "encoder")
+    encoder_lr  = lr * encoder_lr_scale
+
+    buckets: dict[str, list] = {
+        "enc_decay":    [],
+        "enc_nodecay":  [],
+        "hd_decay":     [],
+        "hd_nodecay":   [],
+    }
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_encoder  = has_encoder and name.startswith("encoder.")
+        is_no_decay = id(param) in no_decay_ids or name.endswith(".bias")
+        key = ("enc" if is_encoder else "hd") + ("_nodecay" if is_no_decay else "_decay")
+        buckets[key].append(param)
+
+    param_groups = [
+        {"params": buckets["enc_decay"],   "lr": encoder_lr, "weight_decay": weight_decay},
+        {"params": buckets["enc_nodecay"], "lr": encoder_lr, "weight_decay": 0.0},
+        {"params": buckets["hd_decay"],    "lr": lr,         "weight_decay": weight_decay},
+        {"params": buckets["hd_nodecay"],  "lr": lr,         "weight_decay": 0.0},
+    ]
+    param_groups = [g for g in param_groups if g["params"]]  # drop empty buckets
+
+    return torch.optim.AdamW(param_groups, betas=betas)
+
 
 # ---------------------------------------------------------------------------
 # Hierarchical Cascade: orchestrates Stage 1 + Stage 2
