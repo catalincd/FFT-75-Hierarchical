@@ -231,23 +231,38 @@ def eval_one_epoch(
 # ---------------------------------------------------------------------------
 
 def _load_encoder_from_phase1(encoder: FusedEncoder, ckpt_path: Path, device: str) -> None:
-    """Extract and load only the encoder sub-dict from a phase1 CoarseClassifier checkpoint."""
-    state   = torch.load(ckpt_path, map_location=device, weights_only=True)
+    """
+    Extract ByteEncoder weights from a phase1 CoarseClassifier checkpoint and load
+    them into FusedEncoder.byte_enc.  FusedEncoder.bigram_enc has no phase1 equivalent
+    and is left at its random initialisation.
+
+    Key path translation:
+        phase1 CoarseClassifier  →  FusedEncoder
+        encoder.<key>            →  byte_enc.<key>
+    """
+    state    = torch.load(ckpt_path, map_location=device, weights_only=True)
     model_sd = state["model"]
-    # torch.compile prefixes keys with "_orig_mod."
+    # torch.compile wraps keys with "_orig_mod."
     if any(k.startswith("_orig_mod.") for k in model_sd):
         model_sd = {k.removeprefix("_orig_mod."): v for k, v in model_sd.items()}
-    # CoarseClassifier stores the encoder as self.encoder.*
+
+    # Remap encoder.* → byte_enc.* (ByteEncoder lives at FusedEncoder.byte_enc)
     encoder_sd = {
-        k.removeprefix("encoder."): v
+        "byte_enc." + k.removeprefix("encoder."): v
         for k, v in model_sd.items()
         if k.startswith("encoder.")
     }
-    missing, unexpected = encoder.load_state_dict(encoder_sd, strict=True)
-    if missing or unexpected:
+
+    # strict=False: bigram_enc.* keys are absent from phase1 and stay randomly init'd
+    missing, unexpected = encoder.load_state_dict(encoder_sd, strict=False)
+    unexpected = [k for k in unexpected if not k.startswith("byte_enc.")]
+    non_bigram_missing = [k for k in missing if not k.startswith("bigram_enc.")]
+    if non_bigram_missing or unexpected:
         raise RuntimeError(
-            f"Encoder load mismatch — missing: {missing}, unexpected: {unexpected}"
+            f"Encoder load mismatch — missing: {non_bigram_missing}, unexpected: {unexpected}"
         )
+    n_bigram = len([k for k in missing if k.startswith("bigram_enc.")])
+    print(f"  Loaded byte_enc from phase1; bigram_enc ({n_bigram} tensors) randomly initialised")
 
 
 # ---------------------------------------------------------------------------
