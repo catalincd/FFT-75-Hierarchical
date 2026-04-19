@@ -108,7 +108,12 @@ def load_group_data(
     seed: int = 42,
 ) -> tuple[np.ndarray, list[str]]:
     """Load split, filter to one group, optionally subsample per fine-grained class."""
-    fragments, label_indices, all_types = load_split(split, binary_dir=binary_dir)
+    # mmap=True: the fragment file is memory-mapped rather than read entirely into
+    # RAM.  Only the pages for the rows in `keep` are faulted in from disk, so
+    # loading is proportional to the number of samples kept, not to the total
+    # dataset size.  This makes smoke-test runs (--max-per-class 500) load in
+    # seconds instead of waiting for a multi-GB file to copy into RAM.
+    fragments, label_indices, all_types = load_split(split, mmap=True, binary_dir=binary_dir)
     labels = label_indices_to_strings(label_indices, all_types)
 
     # Filter to this group's fine-grained classes
