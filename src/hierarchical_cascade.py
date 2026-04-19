@@ -266,6 +266,98 @@ class BigramBranch(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Byte2Image intrabyte branch (ByteNet, IEEE TMM 2025 — arXiv:2410.20855)
+# ---------------------------------------------------------------------------
+
+def _bytes_to_bit_patches(x: torch.Tensor, patch_size: int = 8) -> torch.Tensor:
+    """
+    (B, 512) int64 → (B, n_patches, patch_size²) float32.
+
+    Expands each byte into its 8 constituent bits (MSB first), forming a
+    512×8 = 4096-bit sequence.  This is reshaped into a 64×64 binary "image"
+    and then divided into non-overlapping patch_size×patch_size tiles.
+
+    The 2D layout is meaningful: each row corresponds to one byte's bit pattern,
+    so row-aligned attention captures intra-byte structure while column-aligned
+    attention captures alignment across consecutive bytes.
+    """
+    B = x.shape[0]
+    shifts = torch.arange(7, -1, -1, device=x.device)       # [7,6,...,0]
+    bits   = ((x.long().unsqueeze(-1) >> shifts) & 1).float()  # (B, 512, 8)
+    bits   = bits.reshape(B, 64, 64)                         # (B, 64, 64)
+    p      = patch_size
+    n      = 64 // p
+    # unfold both spatial dims to extract non-overlapping p×p patches
+    patches = bits.unfold(1, p, p).unfold(2, p, p)           # (B, n, n, p, p)
+    return patches.reshape(B, n * n, p * p)                  # (B, n², p²)
+
+
+class Byte2ImageBranch(nn.Module):
+    """
+    ByteNet intrabyte branch: 512 bytes → 64×64 bit image → tiny ViT → out_dim.
+
+    The CNN backbone treats bytes as discrete tokens via Embedding(256, d).
+    It captures which byte *values* appear but is blind to the bit-level
+    structure within each byte.  This branch exposes that structure:
+
+      • DEFLATE (zip/gz): Huffman-coded bitstreams have characteristic entropy
+        patterns detectable at the bit column level.
+      • BWT (bz2): block-sorting produces local bit-run clustering.
+      • LZMA (7z): range-coded streams have distinct bit transition statistics.
+      • JSON/XML/CSV: ASCII printable bytes all share bit 7 = 0, bit 6 = 1,
+        and differ in the lower 6 bits — patterns a byte-value CNN must learn
+        indirectly but a bit-image ViT sees immediately.
+
+    Architecture (IMG_SIZE=64, PATCH_SIZE=8):
+        4096 bits → 64×64 image → 64 non-overlapping 8×8 patches
+        → PatchEmbed (64 → embed_dim) + CLS token + learned pos embedding
+        → N × TransformerEncoderLayer (pre-norm, GELU, mlp_ratio=2)
+        → CLS token → LayerNorm → Linear → out_dim
+    """
+    IMG_SIZE   = 64    # sqrt(512 * 8) = 64
+    PATCH_SIZE = 8     # 8×8 patches → (64/8)² = 64 tokens
+
+    def __init__(
+        self,
+        out_dim:   int = 256,
+        embed_dim: int = 128,
+        n_layers:  int = 4,
+        n_heads:   int = 4,
+    ):
+        super().__init__()
+        self.out_dim  = out_dim
+        n_patches     = (self.IMG_SIZE // self.PATCH_SIZE) ** 2   # 64
+
+        self.patch_embed = nn.Linear(self.PATCH_SIZE ** 2, embed_dim)
+        self.cls_token   = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed   = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model         = embed_dim,
+            nhead           = n_heads,
+            dim_feedforward = embed_dim * 2,   # mlp_ratio=2 keeps params light
+            dropout         = 0.1,
+            activation      = "gelu",
+            batch_first     = True,
+            norm_first      = True,            # pre-norm for stable deep training
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.norm        = nn.LayerNorm(embed_dim)
+        self.proj        = nn.Linear(embed_dim, out_dim)
+
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        patches = _bytes_to_bit_patches(x, self.PATCH_SIZE)          # (B, 64, 64)
+        tokens  = self.patch_embed(patches)                           # (B, 64, embed_dim)
+        cls     = self.cls_token.expand(x.shape[0], -1, -1)          # (B, 1, embed_dim)
+        tokens  = torch.cat([cls, tokens], dim=1) + self.pos_embed   # (B, 65, embed_dim)
+        out     = self.transformer(tokens)
+        return self.proj(self.norm(out[:, 0]))                        # (B, out_dim)
+
+
+# ---------------------------------------------------------------------------
 # Fused encoder — CNN branch + bigram branch, same interface as ByteEncoder
 # ---------------------------------------------------------------------------
 
@@ -278,6 +370,7 @@ class FusedEncoder(nn.Module):
     no changes beyond instantiating FusedEncoder instead of ByteEncoder.
 
     Default dims: ByteEncoder(F=128) → 1024, BigramBranch → 512, total 1536.
+    Set use_b2i=True to add the Byte2ImageBranch (+ b2i_dim, default 256).
     """
     def __init__(
         self,
@@ -285,17 +378,23 @@ class FusedEncoder(nn.Module):
         num_filters:     int  = 128,
         bigram_dim:      int  = 512,
         grad_checkpoint: bool = False,
+        use_b2i:         bool = False,
+        b2i_dim:         int  = 256,
     ):
         super().__init__()
         self.byte_enc   = ByteEncoder(embed_dim, num_filters, grad_checkpoint)
         self.bigram_enc = BigramBranch(out_dim=bigram_dim)
-        self.out_dim    = self.byte_enc.out_dim + bigram_dim  # 1536
+        self.b2i_enc    = Byte2ImageBranch(out_dim=b2i_dim) if use_b2i else None
+        self.out_dim    = self.byte_enc.out_dim + bigram_dim + (b2i_dim if use_b2i else 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, L) int64 byte values
         cnn_feat    = self.byte_enc(x)                       # (B, 1024)
         bigram_feat = self.bigram_enc(x)                     # (B, 512)
-        return torch.cat([cnn_feat, bigram_feat], dim=-1)    # (B, 1536)
+        parts = [cnn_feat, bigram_feat]
+        if self.b2i_enc is not None:
+            parts.append(self.b2i_enc(x))                   # (B, b2i_dim)
+        return torch.cat(parts, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -346,10 +445,16 @@ class ArchiveEncoder(nn.Module):
       3. Global sequential patterns and pair co-occurrences (existing).
          → ByteEncoder + BigramBranch (same as FusedEncoder)
 
+      4. Intrabyte bit-level patterns (ByteNet, IEEE TMM 2025).
+         DEFLATE, BWT, and LZMA have characteristic Huffman/range-coding bit
+         patterns detectable at the individual-bit level — invisible to a
+         byte-value CNN but directly exploitable by a ViT on the bit image.
+         → Byte2ImageBranch: 512 bytes → 64×64 bit image → tiny ViT → b2i_dim
+
     Keeps `byte_enc` and `bigram_enc` as top-level attributes so
     `_load_encoder_from_phase1` works without modification.
 
-    out_dim: 1024 (CNN) + 512 (bigram) + 64 (header) + 128 (hist) = 1728
+    out_dim: 1024 (CNN) + 512 (bigram) + 64 (header) + 128 (hist) + 256 (b2i) = 1984
     """
     HEADER_BYTES = 64   # first N bytes of the fragment; covers all magic signatures
 
@@ -360,6 +465,7 @@ class ArchiveEncoder(nn.Module):
         bigram_dim:      int  = 512,
         header_dim:      int  = 64,
         hist_dim:        int  = 128,
+        b2i_dim:         int  = 256,
         grad_checkpoint: bool = False,
     ):
         super().__init__()
@@ -382,7 +488,10 @@ class ArchiveEncoder(nn.Module):
             nn.Linear(256, hist_dim),
         )
 
-        self.out_dim = self.byte_enc.out_dim + bigram_dim + header_dim + hist_dim
+        # Bit-image branch — captures intrabyte entropy patterns per algorithm
+        self.b2i_enc = Byte2ImageBranch(out_dim=b2i_dim)
+
+        self.out_dim = self.byte_enc.out_dim + bigram_dim + header_dim + hist_dim + b2i_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         cnn_feat    = self.byte_enc(x)                                # (B, 1024)
@@ -394,8 +503,9 @@ class ArchiveEncoder(nn.Module):
         )                                                             # (B, header_dim)
 
         hist_feat   = self.hist_mlp(_byte_hist(x))                   # (B, hist_dim)
+        b2i_feat    = self.b2i_enc(x)                                 # (B, b2i_dim)
 
-        return torch.cat([cnn_feat, bigram_feat, header_feat, hist_feat], dim=-1)
+        return torch.cat([cnn_feat, bigram_feat, header_feat, hist_feat, b2i_feat], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -457,10 +567,17 @@ class TextEncoder(nn.Module):
       2. Global sequential + co-occurrence patterns (existing).
          → ByteEncoder + BigramBranch (same as FusedEncoder)
 
+      3. Intrabyte bit-level patterns (ByteNet, IEEE TMM 2025).
+         ASCII printable bytes all have bit-7 = 0 and bit-6 = 1; the lower
+         6 bits encode the character.  Text formats that heavily use specific
+         character ranges (e.g. JSON digits/punctuation vs XML alpha tags)
+         produce distinct patterns in the lower-bit columns of the bit image.
+         → Byte2ImageBranch: 512 bytes → 64×64 bit image → tiny ViT → b2i_dim
+
     Keeps `byte_enc` and `bigram_enc` as top-level attributes so
     `_load_encoder_from_phase1` works without modification.
 
-    out_dim: 1024 (CNN) + 512 (bigram) + 64 (struct) = 1600
+    out_dim: 1024 (CNN) + 512 (bigram) + 64 (struct) + 256 (b2i) = 1856
     """
 
     def __init__(
@@ -469,6 +586,7 @@ class TextEncoder(nn.Module):
         num_filters:     int  = 128,
         bigram_dim:      int  = 512,
         struct_dim:      int  = 64,
+        b2i_dim:         int  = 256,
         grad_checkpoint: bool = False,
     ):
         super().__init__()
@@ -494,7 +612,10 @@ class TextEncoder(nn.Module):
             nn.Linear(128, struct_dim),
         )
 
-        self.out_dim = self.byte_enc.out_dim + bigram_dim + struct_dim
+        # Bit-image branch — captures ASCII bit-column structure per format
+        self.b2i_enc = Byte2ImageBranch(out_dim=b2i_dim)
+
+        self.out_dim = self.byte_enc.out_dim + bigram_dim + struct_dim + b2i_dim
 
     def _struct_freq(self, x: torch.Tensor) -> torch.Tensor:
         """Unigram character occurrence rates. x: (B, L) → (B, n_uni)"""
@@ -512,7 +633,8 @@ class TextEncoder(nn.Module):
         uni_freq    = self._struct_freq(x)                                          # (B, 23)
         bi_freq     = self._bigram_freq(x)                                          # (B, 10)
         struct_feat = self.struct_mlp(torch.cat([uni_freq, bi_freq], dim=-1))       # (B, struct_dim)
-        return torch.cat([cnn_feat, bigram_feat, struct_feat], dim=-1)
+        b2i_feat    = self.b2i_enc(x)                                               # (B, b2i_dim)
+        return torch.cat([cnn_feat, bigram_feat, struct_feat, b2i_feat], dim=-1)
 
 
 # ---------------------------------------------------------------------------
