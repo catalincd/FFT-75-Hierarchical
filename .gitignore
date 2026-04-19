@@ -1,5 +1,6 @@
 # Data — too large for git; download via scripts/download_data.sh
 data/
+results/
 
 # Model checkpoints — store on HuggingFace Hub; upload via scripts/upload_model.sh
 checkpoints/

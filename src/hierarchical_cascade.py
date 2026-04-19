@@ -299,6 +299,201 @@ class FusedEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Specialist encoder — Archive (zip / gz / bz2 / 7z / tar / rar)
+# ---------------------------------------------------------------------------
+
+def _byte_hist(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalised byte-frequency histogram.  x: (B, L) int64  →  (B, 256) float32.
+
+    Unlike the bigram matrix, which encodes *pair* statistics, the unigram
+    histogram captures the marginal distribution of byte values.  This is a
+    compression-algorithm fingerprint: BWT (bz2) produces runs of similar bytes
+    so its histogram is peaky; DEFLATE (zip/gz) and LZMA (7z) are flatter but
+    with different shapes; raw TAR blocks are mostly 0x00-padded.
+    """
+    B, L = x.shape
+    hist = torch.zeros(B, 256, device=x.device, dtype=torch.float32)
+    hist.scatter_add_(1, x.long(), torch.ones(B, L, device=x.device))
+    return hist / L                                          # (B, 256)
+
+
+class ArchiveEncoder(nn.Module):
+    """
+    Encoder specialised for compressed-format discrimination (zip/gz/bz2/7z/tar/rar).
+
+    The core problem: middle-of-file fragments from compressed files are
+    pseudo-random bytes — the *only* reliable discriminating features are:
+
+      1. Magic-header bytes (first few bytes of the *file*).  When the fragment
+         starts near offset 0, these are deterministic:
+           zip  →  PK\\x03\\x04
+           gz   →  \\x1f\\x8b
+           bz2  →  BZh
+           7z   →  7z\\xbc\\xaf\\x27\\x1c
+           rar  →  Rar!\\x1a\\x07
+           tar  →  "ustar" at offset 257 (512-byte header block)
+         Even when the magic bytes are not in the window, the start of a
+         fragment may still fall near format-specific structural regions.
+         → HeaderBranch: embed first HEADER_BYTES bytes → MLP
+
+      2. Compression-algorithm statistical fingerprint: the byte-frequency
+         histogram differs measurably by algorithm even in the middle of the
+         compressed stream.  BWT (bz2) produces value clustering; DEFLATE
+         (zip/gz) is more uniform; LZMA (7z) has characteristic valleys.
+         → HistBranch: 256-d normalised histogram → MLP
+
+      3. Global sequential patterns and pair co-occurrences (existing).
+         → ByteEncoder + BigramBranch (same as FusedEncoder)
+
+    Keeps `byte_enc` and `bigram_enc` as top-level attributes so
+    `_load_encoder_from_phase1` works without modification.
+
+    out_dim: 1024 (CNN) + 512 (bigram) + 64 (header) + 128 (hist) = 1728
+    """
+    HEADER_BYTES = 64   # first N bytes of the fragment; covers all magic signatures
+
+    def __init__(
+        self,
+        embed_dim:       int  = 16,
+        num_filters:     int  = 128,
+        bigram_dim:      int  = 512,
+        header_dim:      int  = 64,
+        hist_dim:        int  = 128,
+        grad_checkpoint: bool = False,
+    ):
+        super().__init__()
+        self.byte_enc   = ByteEncoder(embed_dim, num_filters, grad_checkpoint)
+        self.bigram_enc = BigramBranch(out_dim=bigram_dim)
+
+        # Header branch — embed each of the first HEADER_BYTES bytes to 8-d,
+        # flatten to (HEADER_BYTES * 8), project down to header_dim.
+        self.header_embed = nn.Embedding(256, 8)
+        self.header_mlp   = nn.Sequential(
+            nn.Linear(self.HEADER_BYTES * 8, 256),
+            nn.GELU(),
+            nn.Linear(256, header_dim),
+        )
+
+        # Histogram branch — 256-d unigram frequency → hist_dim
+        self.hist_mlp = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.GELU(),
+            nn.Linear(256, hist_dim),
+        )
+
+        self.out_dim = self.byte_enc.out_dim + bigram_dim + header_dim + hist_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cnn_feat    = self.byte_enc(x)                                # (B, 1024)
+        bigram_feat = self.bigram_enc(x)                              # (B, 512)
+
+        header      = x[:, :self.HEADER_BYTES].long()                # (B, 64)
+        header_feat = self.header_mlp(
+            self.header_embed(header).flatten(1)                      # (B, 64*8)
+        )                                                             # (B, header_dim)
+
+        hist_feat   = self.hist_mlp(_byte_hist(x))                   # (B, hist_dim)
+
+        return torch.cat([cnn_feat, bigram_feat, header_feat, hist_feat], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Specialist encoder — Text (txt / csv / xml / json / html / log)
+# ---------------------------------------------------------------------------
+
+# Structural ASCII characters that discriminate text formats.
+# Each character's *frequency* within a 512-byte window is a strong signal:
+#   JSON  → dense  { } [ ] : "
+#   XML   → dense  < > / =
+#   HTML  → dense  < > / = (+ & entities)
+#   CSV   → dense  ,  and regular \n cadence
+#   log   → dense  :  [ ] and high digit ratio
+#   txt   → low density of all structural chars; mostly alphanumeric + space
+_TEXT_STRUCT_CHARS: list[int] = [
+    # JSON / dict
+    ord('{'), ord('}'), ord('['), ord(']'), ord(':'),
+    # XML / HTML
+    ord('<'), ord('>'), ord('/'), ord('='), ord('&'),
+    # Quoting / strings
+    ord('"'), ord("'"),
+    # CSV / tabular
+    ord(','), ord(';'), ord('|'),
+    # Whitespace patterns
+    ord('\n'), ord('\r'), ord('\t'),
+    # Log / miscellaneous structural
+    ord('#'), ord('@'), ord('\\'), ord('('), ord(')'), ord('!'),
+]   # 23 characters
+
+
+class TextEncoder(nn.Module):
+    """
+    Encoder specialised for text-format discrimination (txt/csv/xml/json/html/log).
+
+    The core problem: all six classes are ASCII/UTF-8 text, so the byte
+    distribution is globally similar.  Discriminating features are:
+
+      1. Structural-character frequency: a 23-dim vector of per-character
+         occurrence rates computed directly from the raw bytes.  This is
+         what a human uses to identify format at a glance — curly braces mean
+         JSON, angle brackets mean XML/HTML, comma density means CSV — but the
+         CNN must build it up slowly via receptive-field expansion.  Providing
+         it explicitly as an additional branch short-circuits that problem.
+         → StructBranch: freq(23 chars) → MLP → 64-d
+
+      2. Global sequential + co-occurrence patterns (existing).
+         → ByteEncoder + BigramBranch (same as FusedEncoder)
+
+    Keeps `byte_enc` and `bigram_enc` as top-level attributes so
+    `_load_encoder_from_phase1` works without modification.
+
+    out_dim: 1024 (CNN) + 512 (bigram) + 64 (struct) = 1600
+    """
+
+    def __init__(
+        self,
+        embed_dim:       int  = 16,
+        num_filters:     int  = 128,
+        bigram_dim:      int  = 512,
+        struct_dim:      int  = 64,
+        grad_checkpoint: bool = False,
+    ):
+        super().__init__()
+        self.byte_enc   = ByteEncoder(embed_dim, num_filters, grad_checkpoint)
+        self.bigram_enc = BigramBranch(out_dim=bigram_dim)
+
+        n = len(_TEXT_STRUCT_CHARS)
+        # Register as buffer so the tensor moves to the correct device automatically
+        self.register_buffer(
+            "_struct_chars",
+            torch.tensor(_TEXT_STRUCT_CHARS, dtype=torch.long),
+        )
+
+        # Structural character branch — (B, n) frequency vector → struct_dim
+        self.struct_mlp = nn.Sequential(
+            nn.Linear(n, 128),
+            nn.GELU(),
+            nn.Linear(128, struct_dim),
+        )
+
+        self.out_dim = self.byte_enc.out_dim + bigram_dim + struct_dim
+
+    def _struct_freq(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Per-character occurrence rate.
+        x: (B, L) int64  →  (B, n_chars) float32  (values in [0, 1])
+        """
+        # (B, L, 1) == (1, 1, n_chars)  →  (B, L, n_chars)  →  mean over L
+        return (x.unsqueeze(-1) == self._struct_chars).float().mean(dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cnn_feat    = self.byte_enc(x)                       # (B, 1024)
+        bigram_feat = self.bigram_enc(x)                     # (B, 512)
+        struct_feat = self.struct_mlp(self._struct_freq(x))  # (B, struct_dim)
+        return torch.cat([cnn_feat, bigram_feat, struct_feat], dim=-1)
+
+
+# ---------------------------------------------------------------------------
 # Stage 1: Coarse Group Classifier
 # ---------------------------------------------------------------------------
 

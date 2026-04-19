@@ -4,7 +4,30 @@ A two-stage hierarchical model for file fragment type classification over the FF
 
 - **Stage 1 (Coarse):** ByteResNet + GeGLU head predicts one of 11 file-type groups
 - **Stage 2 (Specialist):** Per-group fine-grained classifiers predict among 75 file types
-- **Results:** 87% coarse accuracy, 81% cascade fine accuracy, 91% oracle fine accuracy
+- **Results:** 87% coarse accuracy · 79.4% end-to-end accuracy across 58 leaf classes
+
+---
+
+## Results
+
+End-to-end accuracy accounts for coarse routing errors propagating into specialist predictions.
+
+| Group | Classes | Specialist Acc | End-to-End Acc |
+|-------|:-------:|:--------------:|:--------------:|
+| video | 6 | 99.94% | 86.95% |
+| image_raw | 5 | 99.88% | 86.90% |
+| image_raster | 6 | 99.81% | 86.83% |
+| other | 5 | 99.09% | 86.21% |
+| disk_image | 3 | 99.31% | 86.40% |
+| executable | 5 | 98.65% | 85.83% |
+| database | 3 | 95.12% | 82.75% |
+| audio | 6 | 94.89% | 82.56% |
+| document | 7 | 94.11% | 81.87% |
+| archive | 6 | 66.38% | 57.75% |
+| text | 6 | 66.39% | 57.76% |
+| **Total** | **58** | — | **79.4%** |
+
+The `archive` and `text` groups are the primary bottleneck — their byte-level signatures overlap significantly at the fragment level.
 
 ---
 

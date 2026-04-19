@@ -56,6 +56,8 @@ from tqdm import tqdm
 from load_binary import load_split, label_indices_to_strings, BINARY_DIR
 from hierarchical_cascade import (
     FusedEncoder,
+    ArchiveEncoder,
+    TextEncoder,
     SpecialistClassifier,
     FragmentDataset,
     TYPE_TO_GROUP,
@@ -231,7 +233,16 @@ def eval_one_epoch(
 # Encoder initialisation from phase1 checkpoint
 # ---------------------------------------------------------------------------
 
-def _load_encoder_from_phase1(encoder: FusedEncoder, ckpt_path: Path, device: str) -> None:
+def _make_encoder(group: str, grad_checkpoint: bool = False) -> torch.nn.Module:
+    """Return the appropriate encoder for a specialist group."""
+    if group == "archive":
+        return ArchiveEncoder(grad_checkpoint=grad_checkpoint)
+    if group == "text":
+        return TextEncoder(grad_checkpoint=grad_checkpoint)
+    return FusedEncoder(grad_checkpoint=grad_checkpoint)
+
+
+def _load_encoder_from_phase1(encoder: torch.nn.Module, ckpt_path: Path, device: str) -> None:
     """
     Extract ByteEncoder weights from a phase1 CoarseClassifier checkpoint and load
     them into FusedEncoder.byte_enc.  FusedEncoder.bigram_enc has no phase1 equivalent
@@ -254,16 +265,19 @@ def _load_encoder_from_phase1(encoder: FusedEncoder, ckpt_path: Path, device: st
         if k.startswith("encoder.")
     }
 
-    # strict=False: bigram_enc.* keys are absent from phase1 and stay randomly init'd
+    # strict=False: only byte_enc.* is expected to be in the phase1 checkpoint.
+    # All other branches (bigram_enc, header_mlp, hist_mlp, struct_mlp, …) are new
+    # and will be missing — that is correct, they are randomly initialised.
     missing, unexpected = encoder.load_state_dict(encoder_sd, strict=False)
-    unexpected = [k for k in unexpected if not k.startswith("byte_enc.")]
-    non_bigram_missing = [k for k in missing if not k.startswith("bigram_enc.")]
-    if non_bigram_missing or unexpected:
+    unexpected       = [k for k in unexpected if not k.startswith("byte_enc.")]
+    byte_enc_missing = [k for k in missing    if k.startswith("byte_enc.")]
+    if byte_enc_missing or unexpected:
         raise RuntimeError(
-            f"Encoder load mismatch — missing: {non_bigram_missing}, unexpected: {unexpected}"
+            f"Encoder load mismatch — missing byte_enc keys: {byte_enc_missing}, "
+            f"unexpected: {unexpected}"
         )
-    n_bigram = len([k for k in missing if k.startswith("bigram_enc.")])
-    print(f"  Loaded byte_enc from phase1; bigram_enc ({n_bigram} tensors) randomly initialised")
+    n_new = len(missing)   # everything missing is a new randomly-init'd branch
+    print(f"  Loaded byte_enc from phase1; {n_new} new-branch tensors randomly initialised")
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +309,7 @@ def train_specialist(
     log_path    = archive_dir / "training_log.json"
     num_classes = len(GROUPS[group])
 
-    encoder = FusedEncoder(grad_checkpoint=grad_checkpoint)
+    encoder = _make_encoder(group, grad_checkpoint=grad_checkpoint)
 
     if encoder_init in ("from-phase1", "frozen"):
         if phase1_ckpt is None:
