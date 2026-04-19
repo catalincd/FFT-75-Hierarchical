@@ -425,6 +425,19 @@ _TEXT_STRUCT_CHARS: list[int] = [
     ord('#'), ord('@'), ord('\\'), ord('('), ord(')'), ord('!'),
 ]   # 23 characters
 
+_TEXT_BIGRAMS: list[tuple[int, int]] = [
+    (ord('"'), ord(':')),   # "key": — JSON key-value (never in CSV)
+    (ord('}'), ord(',')),   # }, — JSON object in array
+    (ord(']'), ord(',')),   # ], — JSON nested array element
+    (ord('<'), ord('/')),   # </tag> — XML/HTML closing tag
+    (ord('='), ord('"')),   # attr=" — XML/HTML attribute value
+    (ord('/'), ord('>')),   # /> — XML/HTML self-closing tag
+    (ord('<'), ord('!')),   # <!-- — HTML comment/DOCTYPE
+    (ord(','), 10),         # ,\n — CSV row-end
+    (10, ord('"')),         # \n" — CSV quoted field at line start
+    (ord(':'), ord(' ')),   # ": " — log timestamps & JSON values
+]   # 10 bigrams
+
 
 class TextEncoder(nn.Module):
     """
@@ -462,16 +475,21 @@ class TextEncoder(nn.Module):
         self.byte_enc   = ByteEncoder(embed_dim, num_filters, grad_checkpoint)
         self.bigram_enc = BigramBranch(out_dim=bigram_dim)
 
-        n = len(_TEXT_STRUCT_CHARS)
-        # Register as buffer so the tensor moves to the correct device automatically
+        n_uni = len(_TEXT_STRUCT_CHARS)
+        n_bi  = len(_TEXT_BIGRAMS)
+        # Register as buffers so tensors move to the correct device automatically
         self.register_buffer(
             "_struct_chars",
             torch.tensor(_TEXT_STRUCT_CHARS, dtype=torch.long),
         )
+        bigram_a = [a for a, _ in _TEXT_BIGRAMS]
+        bigram_b = [b for _, b in _TEXT_BIGRAMS]
+        self.register_buffer("_bigram_a", torch.tensor(bigram_a, dtype=torch.long))
+        self.register_buffer("_bigram_b", torch.tensor(bigram_b, dtype=torch.long))
 
-        # Structural character branch — (B, n) frequency vector → struct_dim
+        # Structural branch — (B, n_uni + n_bi) frequency vector → struct_dim
         self.struct_mlp = nn.Sequential(
-            nn.Linear(n, 128),
+            nn.Linear(n_uni + n_bi, 128),
             nn.GELU(),
             nn.Linear(128, struct_dim),
         )
@@ -479,17 +497,21 @@ class TextEncoder(nn.Module):
         self.out_dim = self.byte_enc.out_dim + bigram_dim + struct_dim
 
     def _struct_freq(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Per-character occurrence rate.
-        x: (B, L) int64  →  (B, n_chars) float32  (values in [0, 1])
-        """
-        # (B, L, 1) == (1, 1, n_chars)  →  (B, L, n_chars)  →  mean over L
+        """Unigram character occurrence rates. x: (B, L) → (B, n_uni)"""
         return (x.unsqueeze(-1) == self._struct_chars).float().mean(dim=1)
 
+    def _bigram_freq(self, x: torch.Tensor) -> torch.Tensor:
+        """Consecutive-pair occurrence rates. x: (B, L) → (B, n_bi)"""
+        match_a = (x[:, :-1].unsqueeze(-1) == self._bigram_a)
+        match_b = (x[:, 1:].unsqueeze(-1)  == self._bigram_b)
+        return (match_a & match_b).float().mean(dim=1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        cnn_feat    = self.byte_enc(x)                       # (B, 1024)
-        bigram_feat = self.bigram_enc(x)                     # (B, 512)
-        struct_feat = self.struct_mlp(self._struct_freq(x))  # (B, struct_dim)
+        cnn_feat    = self.byte_enc(x)                                              # (B, 1024)
+        bigram_feat = self.bigram_enc(x)                                            # (B, 512)
+        uni_freq    = self._struct_freq(x)                                          # (B, 23)
+        bi_freq     = self._bigram_freq(x)                                          # (B, 10)
+        struct_feat = self.struct_mlp(torch.cat([uni_freq, bi_freq], dim=-1))       # (B, struct_dim)
         return torch.cat([cnn_feat, bigram_feat, struct_feat], dim=-1)
 
 
