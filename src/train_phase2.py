@@ -266,6 +266,79 @@ def eval_one_epoch(
     return total_loss / total_samples, total_correct / total_samples
 
 
+@torch.inference_mode()
+def eval_confusion_matrix(
+    model:       SpecialistClassifier,
+    loader:      DataLoader,
+    device:      str,
+    num_classes: int,
+) -> np.ndarray:
+    """
+    One val pass → (num_classes, num_classes) int64 confusion matrix.
+    conf_mat[true_label, predicted_label] = count.
+    Called only when a new best val_acc is found, so the matrix always
+    corresponds to the best checkpoint without needing to reload weights.
+    """
+    model.eval()
+    conf_mat = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for x, y in loader:
+        x, y  = x.to(device), y.to(device)
+        preds = model(x).argmax(dim=-1)
+        for t, p in zip(y.cpu().tolist(), preds.cpu().tolist()):
+            conf_mat[t, p] += 1
+    return conf_mat
+
+
+def format_confusion_matrix(conf_mat: np.ndarray, class_names: list[str]) -> str:
+    """
+    Format a confusion matrix as a compact, readable table.
+
+    Layout  (row = true class, col = predicted class):
+      • Diagonal  [XX%]  = per-class recall
+      • Off-diag   XX%   = fraction of that true class predicted as that column
+      • Blank            = < 1% (suppressed to reduce noise)
+      • Bottom row       = per-class precision
+
+    Example for archive (6 classes):
+        zip   gz  bz2   7z  tar  rar
+    zip [73%] 22%           4%
+     gz  12% [81%]           6%
+    bz2      [94%]
+     7z      [89%]
+    tar   4%       4%  [78%] 12%
+    rar   3%       2%       [85%]
+    """
+    n       = len(class_names)
+    lbl_w   = max(len(c) for c in class_names)
+    cell_w  = max(lbl_w, 6)          # min 6 to fit "[100%]"
+
+    row_totals = conf_mat.sum(axis=1).clip(1)
+    col_totals = conf_mat.sum(axis=0).clip(1)
+    pct        = conf_mat / row_totals[:, None] * 100   # row-normalised recall
+
+    def cell(i: int, j: int) -> str:
+        v = pct[i, j]
+        if i == j:
+            return f"[{v:3.0f}%]".center(cell_w)
+        if v >= 1.0:
+            return f"{v:3.0f}% ".rjust(cell_w)
+        return " " * cell_w
+
+    sep     = "-" * (lbl_w + 2 + n * (cell_w + 1))
+    header  = " " * (lbl_w + 2) + " ".join(c.center(cell_w) for c in class_names)
+    lines   = [header, sep]
+    for i, name in enumerate(class_names):
+        lines.append(f"{name:>{lbl_w}}  " + " ".join(cell(i, j) for j in range(n)))
+    lines.append(sep)
+
+    # Precision row
+    prec = np.diag(conf_mat) / col_totals * 100
+    lines.append(
+        f"{'prec':>{lbl_w}}  " + " ".join(f"{p:3.0f}% ".rjust(cell_w) for p in prec)
+    )
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Encoder initialisation from phase1 checkpoint
 # ---------------------------------------------------------------------------
@@ -522,6 +595,17 @@ def train_specialist(
             if best_path.exists() or best_path.is_symlink():
                 best_path.unlink()
             best_path.symlink_to(ckpt_path.name)
+
+            # Confusion matrix — computed here so it always matches the best
+            # checkpoint without needing to reload weights after the loop.
+            conf_mat = eval_confusion_matrix(model, val_loader, device, num_classes)
+            class_names = GROUPS[group]
+            log["confusion_matrix"]         = conf_mat.tolist()
+            log["confusion_matrix_classes"] = class_names
+            print(f"\n  [{group}] val confusion matrix (row=true, col=pred):")
+            for line in format_confusion_matrix(conf_mat, class_names).split("\n"):
+                print(f"    {line}")
+            print()
 
         _atomic_write_json(log_path, log)
 
