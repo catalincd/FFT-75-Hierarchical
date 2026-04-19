@@ -43,6 +43,7 @@ Usage:
 """
 
 import json
+import random
 import time
 import torch
 import torch.nn.functional as F
@@ -158,6 +159,7 @@ def train_one_epoch(
     grad_clip: float = 1.0,
     accum_steps: int = 1,
     label_smoothing: float = 0.0,
+    cutmix_alpha: float = 0.0,
 ) -> tuple[float, float]:
     model.train()
     total_loss = total_correct = total_samples = 0
@@ -172,9 +174,39 @@ def train_one_epoch(
         is_last   = (step == n_batches)
         do_update = (step % accum_steps == 0) or is_last
 
+        # Byte CutMix: splice a contiguous region from a shuffled copy of the
+        # batch into x, mix labels proportionally.
+        #
+        # Why bytes and not embeddings: byte sequences are integers so linear
+        # interpolation is meaningless. Splicing a contiguous region is valid
+        # because compressed / structured files have region-level statistics
+        # (e.g. a GZ header block) — swapping a region teaches the model that
+        # ambiguous fragments deserve uncertain predictions.
+        #
+        # Applied with 50% probability per batch so half the steps still see
+        # clean examples, preserving the model's ability to learn from clear signal.
+        y_mix, lam_eff = y, 1.0
+        if cutmix_alpha > 0 and random.random() < 0.5:
+            B, L     = x.shape
+            lam      = np.random.beta(cutmix_alpha, cutmix_alpha)
+            cut_size = int(L * (1 - lam))
+            if cut_size > 0:
+                start   = random.randint(0, L - cut_size)
+                j       = torch.randperm(B, device=device)
+                x       = x.clone()
+                x[:, start:start + cut_size] = x[j, start:start + cut_size]
+                y_mix   = y[j]
+                lam_eff = 1.0 - cut_size / L   # actual λ after integer truncation
+
         with torch.autocast(device_type=device_type, enabled=(scaler is not None)):
             logits = model(x)
-            loss   = F.cross_entropy(logits, y, label_smoothing=label_smoothing) / accum_steps
+            if lam_eff < 1.0:
+                loss = (
+                    lam_eff       * F.cross_entropy(logits, y,    label_smoothing=label_smoothing) +
+                    (1 - lam_eff) * F.cross_entropy(logits, y_mix, label_smoothing=label_smoothing)
+                ) / accum_steps
+            else:
+                loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing) / accum_steps
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -302,6 +334,7 @@ def train_specialist(
     label_smoothing: float = 0.1,
     warmup_pct:      float = 0.05,
     compile_model:   bool  = False,
+    cutmix_alpha:    float = 0.0,
     extra_config:    dict  = {},
 ) -> SpecialistClassifier:
 
@@ -398,6 +431,7 @@ def train_specialist(
                 "weight_decay":    weight_decay,
                 "betas":           [0.9, 0.999],
                 "label_smoothing": label_smoothing,
+                "cutmix_alpha":    cutmix_alpha,
                 "warmup_pct":      warmup_pct,
                 "optimizer":       "AdamW",
                 "scheduler":       "LinearWarmup+CosineAnnealing",
@@ -433,7 +467,7 @@ def train_specialist(
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, optimizer, device, pbar,
                 scaler=scaler, scheduler=scheduler, accum_steps=accum_steps,
-                label_smoothing=label_smoothing,
+                label_smoothing=label_smoothing, cutmix_alpha=cutmix_alpha,
             )
 
         val_loss, val_acc = eval_one_epoch(model, val_loader, device)
@@ -527,6 +561,10 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-pct",    type=float, default=0.05)
     parser.add_argument("--weight-decay",  type=float, default=0.01)
     parser.add_argument("--label-smoothing", type=float, default=0.1)
+    parser.add_argument("--noise-prob",    type=float, default=0.02,
+                        help="Fraction of bytes to randomly corrupt per training sample (default: 0.02)")
+    parser.add_argument("--cutmix-alpha",  type=float, default=0.4,
+                        help="Beta distribution alpha for byte CutMix; 0 to disable (default: 0.4)")
     parser.add_argument("--grad-accum",    type=int,   default=1)
     parser.add_argument("--grad-checkpoint", action="store_true")
     parser.add_argument("--compile",       action="store_true")
@@ -592,8 +630,10 @@ if __name__ == "__main__":
         )
         print(f"  {len(val_labels)} fragments, {len(set(val_labels))} classes")
 
-        train_ds = FragmentDataset(train_frags, train_labels, mode=f"specialist:{group}")
-        val_ds   = FragmentDataset(val_frags,   val_labels,   mode=f"specialist:{group}")
+        train_ds = FragmentDataset(train_frags, train_labels, mode=f"specialist:{group}",
+                                   augment=True, noise_prob=args.noise_prob)
+        val_ds   = FragmentDataset(val_frags,   val_labels,   mode=f"specialist:{group}",
+                                   augment=False)
 
         train_loader = DataLoader(train_ds, shuffle=True,  **dl_kwargs)
         val_loader   = DataLoader(val_ds,   shuffle=False, **dl_kwargs)
@@ -618,6 +658,7 @@ if __name__ == "__main__":
             label_smoothing  = args.label_smoothing,
             warmup_pct       = args.warmup_pct,
             compile_model    = args.compile,
+            cutmix_alpha     = args.cutmix_alpha,
             extra_config     = {
                 "group":            group,
                 "max_per_class":    args.max_per_class,

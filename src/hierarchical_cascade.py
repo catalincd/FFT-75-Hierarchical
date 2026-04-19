@@ -769,42 +769,61 @@ def load_data(
 
 class FragmentDataset(Dataset):
     """
-    Minimal dataset wrapper for FFT-75 style data.
+    Dataset wrapper for FFT-75 style data with optional byte-level augmentation.
 
     Expected: fragments as (N, 512) uint8 numpy array,
               fine-grained labels as list of type strings length N.
+
+    Augmentation (training only, set augment=True):
+        Byte noise — randomly replaces `noise_prob` fraction of bytes with
+        uniformly random values (0-255) each time a sample is fetched.
+        Because the DataLoader re-fetches every epoch, the same fragment
+        appears in a slightly different corrupted form every epoch, giving
+        the model effectively infinite variations of each training example.
+        This prevents memorisation of exact byte patterns without requiring
+        any additional real data.
     """
     def __init__(
         self,
-        fragments: np.ndarray,
-        labels: list[str],
-        mode: str = "coarse",          # "coarse" | "specialist:<group>"
+        fragments:  np.ndarray,
+        labels:     list[str],
+        mode:       str   = "coarse",   # "coarse" | "specialist:<group>"
+        augment:    bool  = False,      # enable byte-noise augmentation
+        noise_prob: float = 0.02,       # fraction of bytes to corrupt per sample
     ):
         assert len(fragments) == len(labels)
         assert mode == "coarse" or mode.startswith("specialist:")
 
-        self.mode = mode
-        target_group = mode.split(":")[1] if ":" in mode else None
+        self.mode       = mode
+        self.augment    = augment
+        self.noise_prob = noise_prob
+        target_group    = mode.split(":")[1] if ":" in mode else None
 
         if target_group is not None:
-            # Filter to only samples belonging to this group
             keep = [
                 i for i, lbl in enumerate(labels)
                 if TYPE_TO_GROUP.get(lbl) == target_group
             ]
             self.fragments = fragments[keep]
             self.labels    = [labels[i] for i in keep]
-            self.label_map = GROUP_LOCAL_IDX[target_group]  # local int labels
+            self.label_map = GROUP_LOCAL_IDX[target_group]
         else:
             self.fragments = fragments
             self.labels    = labels
-            self.label_map = GROUP_TO_IDX                   # group int labels
+            self.label_map = GROUP_TO_IDX
 
     def __len__(self) -> int:
         return len(self.fragments)
 
     def __getitem__(self, idx: int):
         x = torch.from_numpy(self.fragments[idx].astype(np.int64))
+
+        if self.augment and self.noise_prob > 0:
+            # Salt-and-pepper byte corruption: random bytes override ~noise_prob
+            # of positions.  Byte values stay in [0, 255].
+            mask  = torch.rand(x.shape) < self.noise_prob
+            noise = torch.randint_like(x, 0, 256)
+            x     = torch.where(mask, noise, x)
 
         if self.mode == "coarse":
             group = TYPE_TO_GROUP[self.labels[idx]]
