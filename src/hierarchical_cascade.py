@@ -11,6 +11,7 @@ This mirrors the FFT-75 scenario structure:
 """
 
 import json
+import random
 import time
 import torch
 from datetime import datetime
@@ -60,7 +61,123 @@ GROUP_LOCAL_IDX: dict[str, dict[str, int]] = {
 }
 
 NUM_GROUPS   = len(GROUP_NAMES)                 # 11
+NUM_TYPES    = len(ALL_TYPES)                   # 58
 SECTOR_SIZE  = 512                              # bytes per fragment
+
+# Global index for each (group, local_idx) pair: GROUP_GLOBAL_INDICES[g] -> (num_local,) tensor
+# Used by predict_soft to scatter per-group probabilities back to the global 75-class space.
+GROUP_GLOBAL_INDICES: dict[str, list[int]] = {
+    g: [TYPE_TO_IDX[t] for t in types] for g, types in GROUPS.items()
+}
+
+# ---------------------------------------------------------------------------
+# Magic-byte signatures used as self-supervised "is_header" pseudo-labels
+# Only the most reliable, unambiguous signatures are listed.  When a fragment's
+# first bytes match one of its true class' magic patterns, it is labelled a
+# header (1); otherwise non-header (0).  This auxiliary signal teaches the
+# encoder to attend to magic-byte regions when present and to fall back on
+# distribution-only features when they are absent.
+# ---------------------------------------------------------------------------
+
+_HEADER_MAGICS: dict[str, list[bytes]] = {
+    "jpg":    [b"\xFF\xD8\xFF"],
+    "png":    [b"\x89PNG\r\n\x1a\n"],
+    "gif":    [b"GIF87a", b"GIF89a"],
+    "bmp":    [b"BM"],
+    "tiff":   [b"II*\x00", b"MM\x00*"],
+    "webp":   [b"RIFF"],   # also need WEBP at offset 8; we do that check separately
+    "pdf":    [b"%PDF-"],
+    "doc":    [b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+    "docx":   [b"PK\x03\x04"],   # OOXML is a zip — partial signal
+    "xls":    [b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+    "xlsx":   [b"PK\x03\x04"],
+    "ppt":    [b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+    "pptx":   [b"PK\x03\x04"],
+    "zip":    [b"PK\x03\x04", b"PK\x05\x06"],
+    "gz":     [b"\x1F\x8B"],
+    "bz2":    [b"BZh"],
+    "7z":     [b"7z\xBC\xAF\x27\x1C"],
+    "rar":    [b"Rar!\x1A\x07\x00", b"Rar!\x1A\x07\x01\x00"],
+    "elf":    [b"\x7FELF"],
+    "exe":    [b"MZ"],
+    "dll":    [b"MZ"],
+    "class":  [b"\xCA\xFE\xBA\xBE"],
+    "mp3":    [b"ID3", b"\xFF\xFB", b"\xFF\xFA", b"\xFF\xF3", b"\xFF\xF2"],
+    "flac":   [b"fLaC"],
+    "ogg":    [b"OggS"],
+    "wav":    [b"RIFF"],
+    "m4a":    [b"\x00\x00\x00\x20ftyp", b"\x00\x00\x00\x18ftyp"],
+    "aac":    [b"\xFF\xF1", b"\xFF\xF9"],
+    "mp4":    [b"\x00\x00\x00\x18ftyp", b"\x00\x00\x00\x20ftyp", b"\x00\x00\x00\x1Cftyp"],
+    "mov":    [b"\x00\x00\x00\x14ftyp", b"\x00\x00\x00\x20ftypqt"],
+    "mkv":    [b"\x1A\x45\xDF\xA3"],
+    "avi":    [b"RIFF"],
+    "wmv":    [b"\x30\x26\xB2\x75\x8E\x66\xCF\x11"],
+    "flv":    [b"FLV\x01"],
+    "sqlite": [b"SQLite format 3\x00"],
+    "ttf":    [b"\x00\x01\x00\x00", b"true", b"OTTO"],
+    "ps":     [b"%!PS"],
+    "eps":    [b"%!PS-Adobe", b"\xC5\xD0\xD3\xC6"],
+    "psd":    [b"8BPS"],
+    "swf":    [b"FWS", b"CWS", b"ZWS"],
+    "iso":    [],   # CD001 is at offset 0x8001 — outside our 512-byte window
+    "img":    [],
+    "vmdk":   [b"KDMV", b"# Disk DescriptorFile"],
+    "db":     [b"SQLite format 3\x00"],   # often sqlite-backed
+    "mdb":    [b"\x00\x01\x00\x00Standard Jet DB"],
+    "cr2":    [b"II*\x00\x10\x00\x00\x00CR"],
+    "nef":    [b"MM\x00*"],
+    "arw":    [b"II*\x00"],
+    "dng":    [b"II*\x00"],
+    "orf":    [b"IIRO", b"MMOR"],
+    # text formats have no fixed magic; left empty so they always get is_header=0
+}
+
+# Build a per-class-index list of magic-byte tensors for fast batched checking on GPU.
+# For each true class index, store list of (magic_bytes, length) pairs.
+def _build_magic_table() -> list[list[bytes]]:
+    return [_HEADER_MAGICS.get(t, []) for t in ALL_TYPES]
+
+_MAGIC_TABLE: list[list[bytes]] = _build_magic_table()
+
+# Maximum magic length across all classes — used to bound how many bytes to inspect.
+_MAX_MAGIC_LEN = max((len(m) for ms in _MAGIC_TABLE for m in ms), default=8)
+
+
+def detect_header_pseudo_labels(
+    x: torch.Tensor,
+    fine_label_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute a binary header/non-header pseudo-label per sample.
+
+    A fragment is labelled a header (1) iff its first bytes match one of its
+    true class' known magic-byte signatures, otherwise non-header (0).
+    Performed on CPU because byte-exact matching is awkward in tensor ops and
+    the cost (~few hundred µs per batch) is negligible vs the encoder forward.
+
+    Args:
+        x:                    (B, L) byte values, any device
+        fine_label_indices:   (B,)   int64 fine-grained class indices (0..NUM_TYPES-1)
+
+    Returns:
+        is_header:            (B,)   int64 ∈ {0, 1} on the same device as x
+    """
+    B = x.shape[0]
+    head = x[:, :_MAX_MAGIC_LEN].detach().to(torch.uint8).cpu().numpy().tobytes()
+    # head is concatenated rows, each of length _MAX_MAGIC_LEN
+    out = np.zeros(B, dtype=np.int64)
+    fine_idx_cpu = fine_label_indices.detach().cpu().numpy()
+    for i in range(B):
+        magics = _MAGIC_TABLE[int(fine_idx_cpu[i])]
+        if not magics:
+            continue
+        row = head[i * _MAX_MAGIC_LEN : (i + 1) * _MAX_MAGIC_LEN]
+        for m in magics:
+            if row[: len(m)] == m:
+                out[i] = 1
+                break
+    return torch.from_numpy(out).to(x.device)
 
 # ---------------------------------------------------------------------------
 # Building blocks (ByteResNet / JSANet inspired, 2024)
@@ -282,6 +399,9 @@ def _bytes_to_bit_patches(x: torch.Tensor, patch_size: int = 8) -> torch.Tensor:
     attention captures alignment across consecutive bytes.
     """
     B = x.shape[0]
+    # Use only the first 512 bytes regardless of sector size; the bit-image
+    # layout is always 512*8 = 4096 bits → 64×64.
+    x      = x[:, :512]
     shifts = torch.arange(7, -1, -1, device=x.device)       # [7,6,...,0]
     bits   = ((x.long().unsqueeze(-1) >> shifts) & 1).float()  # (B, 512, 8)
     bits   = bits.reshape(B, 64, 64)                         # (B, 64, 64)
@@ -643,7 +763,8 @@ class TextEncoder(nn.Module):
 
 class CoarseClassifier(nn.Module):
     """
-    Predicts one of NUM_GROUPS coarse groups.
+    Predicts one of NUM_GROUPS coarse groups, with an optional auxiliary
+    binary "is_header" position head trained jointly via multitask loss.
 
     Over the baseline 3-layer BN-MLP:
       - LayerNorm: per-sample, no batch-stat sensitivity; cascade routing often
@@ -654,8 +775,15 @@ class CoarseClassifier(nn.Module):
       - Single residual hidden layer: Scenario #2 (11 classes) is well-separated
         by the encoder; the third BN-MLP layer added depth without benefit
       - Skip projection: gradient highway so the encoder is never a bottleneck
+
+    Position head (optional):
+      A small 2-class head sharing the encoder feature.  Supervised by
+      magic-byte pseudo-labels (see detect_header_pseudo_labels).  Forces the
+      encoder to expose information about whether the fragment starts at a
+      file boundary, which improves group routing for header-heavy formats
+      (zip, gz, ELF, MZ, …) and makes the encoder explicitly position-aware.
     """
-    def __init__(self, encoder: ByteEncoder):
+    def __init__(self, encoder: ByteEncoder, with_position_head: bool = False):
         super().__init__()
         self.encoder = encoder
         d      = encoder.out_dim          # 1536 with FusedEncoder (1024 CNN + 512 bigram)
@@ -670,11 +798,42 @@ class CoarseClassifier(nn.Module):
         self.out_norm   = nn.LayerNorm(hidden)
         self.head       = nn.Linear(hidden, NUM_GROUPS)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.norm(self.encoder(x))                    # (B, d)
+        # Optional auxiliary head: 2-class is_header.  Tiny (a single MLP) so
+        # most parameters remain in the main head; the encoder feature is shared.
+        self.position_head: Optional[nn.Module] = None
+        if with_position_head:
+            self.position_head = nn.Sequential(
+                nn.Linear(d, hidden, bias=False),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(hidden, 2),
+            )
+
+    def _shared_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Encoder forward + LayerNorm — shared between main and position heads."""
+        return self.norm(self.encoder(x))
+
+    def _main_logits(self, feat: torch.Tensor) -> torch.Tensor:
         v, g = self.geglu_proj(feat).chunk(2, dim=-1)        # each (B, hidden)
         h    = self.drop(v * F.gelu(g)) + self.skip(feat)   # GeGLU + residual
         return self.head(self.out_norm(h))                   # (B, NUM_GROUPS)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._main_logits(self._shared_features(x))
+
+    def forward_with_position(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Returns (group_logits, position_logits) where position_logits is None
+        if no position head was attached.  Used during training when a
+        position pseudo-label is available; inference paths can use the
+        plain forward() to skip the auxiliary head.
+        """
+        feat = self._shared_features(x)
+        main = self._main_logits(feat)
+        pos  = self.position_head(feat) if self.position_head is not None else None
+        return main, pos
 
 # ---------------------------------------------------------------------------
 # Stage 2: Per-Group Fine-Grained Specialist
@@ -683,17 +842,33 @@ class CoarseClassifier(nn.Module):
 
 class SpecialistClassifier(nn.Module):
     """
-    Predicts the fine-grained type within a single group.
+    Predicts the fine-grained type within a single group.  When
+    `with_rejection=True`, an extra output channel is added at index
+    `num_classes` representing "out-of-group".  This serves two purposes:
 
-    Head matches CoarseClassifier quality: LayerNorm → Linear → GELU →
-    Dropout → residual skip → LayerNorm → head.  The original Sequential
-    (Linear → ReLU → Dropout → Linear) had no input normalisation and no
-    skip path, which made it harder to train when the encoder is pretrained
-    and the head is randomly initialised.
+      1. Calibration for soft-routing inference: the specialist learns to
+         output low in-group probability mass for inputs that don't belong to
+         its group.  Marginalising P(g|x) · P(c|x,g) across all groups then
+         gives a coherent global posterior over the 75 classes.
+
+      2. Robustness to coarse-routing errors: when the coarse classifier
+         mis-routes a sample, the wrong specialist now has the option of
+         flagging "this isn't mine" rather than guessing one of its in-group
+         labels.
+
+    Head architecture is shared: LayerNorm → Linear → GELU → Dropout → residual
+    skip → LayerNorm → head.  Only the final head's output dimension changes.
     """
-    def __init__(self, encoder: ByteEncoder, num_classes: int):
+    def __init__(
+        self,
+        encoder: ByteEncoder,
+        num_classes: int,
+        with_rejection: bool = False,
+    ):
         super().__init__()
-        self.encoder  = encoder
+        self.encoder        = encoder
+        self.num_classes    = num_classes
+        self.with_rejection = with_rejection
         d             = encoder.out_dim
         hidden        = d // 4              # 384 for FusedEncoder (1536 // 4)
         self.norm     = nn.LayerNorm(d)
@@ -701,12 +876,13 @@ class SpecialistClassifier(nn.Module):
         self.drop     = nn.Dropout(0.3)
         self.skip     = nn.Linear(d, hidden, bias=False)
         self.out_norm = nn.LayerNorm(hidden)
-        self.head     = nn.Linear(hidden, num_classes)
+        out_dim       = num_classes + (1 if with_rejection else 0)
+        self.head     = nn.Linear(hidden, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.norm(self.encoder(x))                   # (B, d)
         h    = self.drop(F.gelu(self.fc1(feat))) + self.skip(feat)  # (B, hidden)
-        return self.head(self.out_norm(h))                  # (B, num_classes)
+        return self.head(self.out_norm(h))                  # (B, num_classes [+1])
 
 
 # ---------------------------------------------------------------------------
@@ -786,20 +962,34 @@ class HierarchicalCascade(nn.Module):
     Sharing saves memory and promotes general representations; separate encoders
     allow each specialist to learn format-specific low-level features.
     """
-    def __init__(self, shared_encoder: bool = True):
+    def __init__(
+        self,
+        shared_encoder:     bool = True,
+        coarse_use_b2i:     bool = True,
+        coarse_position_head: bool = True,
+        specialists_with_rejection: bool = True,
+    ):
         super().__init__()
 
         if shared_encoder:
-            encoder = FusedEncoder()
-            self.coarse = CoarseClassifier(encoder)
+            encoder = FusedEncoder(use_b2i=coarse_use_b2i)
+            self.coarse = CoarseClassifier(encoder, with_position_head=coarse_position_head)
             self.specialists = nn.ModuleDict({
-                group: SpecialistClassifier(encoder, len(types))
+                group: SpecialistClassifier(
+                    encoder, len(types), with_rejection=specialists_with_rejection
+                )
                 for group, types in GROUPS.items()
             })
         else:
-            self.coarse = CoarseClassifier(FusedEncoder())
+            self.coarse = CoarseClassifier(
+                FusedEncoder(use_b2i=coarse_use_b2i),
+                with_position_head=coarse_position_head,
+            )
             self.specialists = nn.ModuleDict({
-                group: SpecialistClassifier(FusedEncoder(), len(types))
+                group: SpecialistClassifier(
+                    FusedEncoder(use_b2i=coarse_use_b2i), len(types),
+                    with_rejection=specialists_with_rejection,
+                )
                 for group, types in GROUPS.items()
             })
 
@@ -820,7 +1010,7 @@ class HierarchicalCascade(nn.Module):
         return_confidence: bool = False,
     ) -> tuple[list[str], Optional[torch.Tensor]]:
         """
-        Full cascade inference.
+        Full cascade inference (hard routing — argmax at coarse stage).
 
         Returns:
             predictions: list of predicted fine-grained type strings, length B
@@ -831,7 +1021,7 @@ class HierarchicalCascade(nn.Module):
         group_probs  = F.softmax(group_logits, dim=-1)
         group_preds  = group_logits.argmax(dim=-1)          # (B,)
 
-        predictions: list[str] = []
+        predictions: list[Optional[str]] = [None] * len(x)
         group_confs  = group_probs.max(dim=-1).values       # (B,)
         type_confs   = torch.zeros(len(x), device=x.device)
 
@@ -844,20 +1034,97 @@ class HierarchicalCascade(nn.Module):
 
             x_sub = x[mask]                                 # (k, 512)
             specialist = self.specialists[group_name]
-            type_logits = specialist(x_sub)                 # (k, num_types)
-            type_probs  = F.softmax(type_logits, dim=-1)
-            local_preds = type_logits.argmax(dim=-1)        # (k,)
+            type_logits = specialist(x_sub)                 # (k, num_types [+1])
+            num_local   = len(GROUPS[group_name])
+            # Drop the rejection class (last channel) if present — it must not
+            # be predicted at hard-cascade inference time.
+            in_group_logits = type_logits[:, :num_local]
+            type_probs      = F.softmax(in_group_logits, dim=-1)
+            local_preds     = in_group_logits.argmax(dim=-1)
 
             type_confs[mask] = type_probs.max(dim=-1).values
             local_types = GROUPS[group_name]
             for i, sample_idx in enumerate(mask.tolist()):
-                predictions.insert(sample_idx, local_types[local_preds[i].item()])
+                predictions[sample_idx] = local_types[local_preds[i].item()]
 
         if return_confidence:
             conf = torch.stack([group_confs, type_confs], dim=-1)  # (B, 2)
             return predictions, conf
 
         return predictions, None
+
+    @torch.no_grad()
+    def predict_soft(
+        self,
+        x:     torch.Tensor,
+        top_k: int = 3,
+    ) -> tuple[list[str], torch.Tensor]:
+        """
+        Mixture-of-Experts inference: marginalise over top-K coarse groups.
+
+        For each sample we compute
+            P(c | x) = Σ_g P(g | x) · P(c | x, g)     for c ∈ group g
+        restricted to the top-K coarse groups (re-normalised) for efficiency.
+        When specialists carry a rejection class, the in-group probability
+        mass is left as-is (not re-normalised) so out-of-group inputs that
+        the specialist correctly rejects contribute negligibly.
+
+        This recovers most of the cascade routing error: when the true group
+        is the coarse classifier's #2 or #3 candidate (instead of #1), the
+        joint score for the true class can still win.
+
+        Args:
+            x:     (B, L) byte values
+            top_k: number of coarse candidates to score per sample (1..NUM_GROUPS)
+
+        Returns:
+            predictions:  list of NUM_TYPES-string predictions, length B
+            full_probs:   (B, NUM_TYPES) marginalised posterior
+        """
+        assert 1 <= top_k <= NUM_GROUPS
+        B = x.shape[0]
+        device = x.device
+
+        coarse_logits = self.coarse(x)                       # (B, NUM_GROUPS)
+        coarse_probs  = F.softmax(coarse_logits, dim=-1)
+
+        # Top-K group probabilities, re-normalised so they sum to 1.
+        topk_probs, topk_idx = coarse_probs.topk(top_k, dim=-1)      # (B, K)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        full_probs = torch.zeros(B, NUM_TYPES, device=device)
+
+        # For each group, run the specialist once on all samples that have it
+        # in their top-K, weight by P(g|x), and scatter into the global slots.
+        for g_idx, g_name in enumerate(GROUP_NAMES):
+            in_topk = (topk_idx == g_idx)                            # (B, K) bool
+            sample_in_topk = in_topk.any(dim=-1)                     # (B,)
+            if not sample_in_topk.any():
+                continue
+
+            sel = sample_in_topk.nonzero(as_tuple=True)[0]           # (M,)
+            x_sub = x[sel]
+            spec_logits = self.specialists[g_name](x_sub)
+            num_local   = len(GROUPS[g_name])
+            spec_probs  = F.softmax(spec_logits, dim=-1)
+            # In-group mass only (rejection slot, if present, is dropped here
+            # but its softmax presence already dampened the in-group magnitudes).
+            local_probs = spec_probs[:, :num_local]                  # (M, num_local)
+
+            # Per-sample weight = P(g|x) if g is in this sample's top-K, else 0.
+            # Sum across the K axis (row has at most one True for this g).
+            weights = (topk_probs[sel] * in_topk[sel].float()).sum(dim=-1)  # (M,)
+            weighted = local_probs * weights.unsqueeze(-1)           # (M, num_local)
+
+            global_indices = torch.tensor(
+                GROUP_GLOBAL_INDICES[g_name], device=device, dtype=torch.long
+            )                                                        # (num_local,)
+            # Add to the right global columns for the right rows
+            full_probs[sel.unsqueeze(-1), global_indices.unsqueeze(0)] += weighted
+
+        pred_idx = full_probs.argmax(dim=-1).tolist()
+        predictions = [ALL_TYPES[i] for i in pred_idx]
+        return predictions, full_probs
 
 # ---------------------------------------------------------------------------
 # Data loading with optional subsampling
@@ -911,6 +1178,17 @@ def load_data(
 # Dataset
 # ---------------------------------------------------------------------------
 
+def _is_header_for_label(raw: bytes, label_str: str) -> int:
+    """1 iff the raw bytes start with one of label_str's known magics, else 0."""
+    magics = _HEADER_MAGICS.get(label_str)
+    if not magics:
+        return 0
+    for m in magics:
+        if raw[:len(m)] == m:
+            return 1
+    return 0
+
+
 class FragmentDataset(Dataset):
     """
     Dataset wrapper for FFT-75 style data with optional byte-level augmentation.
@@ -918,63 +1196,124 @@ class FragmentDataset(Dataset):
     Expected: fragments as (N, 512) uint8 numpy array,
               fine-grained labels as list of type strings length N.
 
+    Modes:
+        "coarse"             — y is the group index (0..NUM_GROUPS-1)
+        "specialist:<group>" — y is the local fine-grained class index within
+                               the group; or `num_local` (the rejection slot)
+                               for rejection-mixed samples.
+
     Augmentation (training only, set augment=True):
         Byte noise — randomly replaces `noise_prob` fraction of bytes with
         uniformly random values (0-255) each time a sample is fetched.
-        Because the DataLoader re-fetches every epoch, the same fragment
-        appears in a slightly different corrupted form every epoch, giving
-        the model effectively infinite variations of each training example.
-        This prevents memorisation of exact byte patterns without requiring
-        any additional real data.
+
+    Multi-task heads (optional, additive return values):
+        with_position=True   — emit a per-sample binary is_header pseudo-label
+                               (computed via _is_header_for_label).  Coarse
+                               mode only.  Returned as the third item of the
+                               tuple; ignored by the training loop when the
+                               coarse classifier has no position head.
+        rejection_prob > 0   — Specialist mode only.  With this probability
+                               each fetched sample is replaced by an
+                               out-of-group fragment labelled with the
+                               rejection class index (= num_local).  Trains
+                               the specialist to flag inputs that don't
+                               belong to its group.
     """
     def __init__(
         self,
-        fragments:  np.ndarray,
-        labels:     list[str],
-        mode:       str   = "coarse",   # "coarse" | "specialist:<group>"
-        augment:    bool  = False,      # enable byte-noise augmentation
-        noise_prob: float = 0.02,       # fraction of bytes to corrupt per sample
+        fragments:      np.ndarray,
+        labels:         list[str],
+        mode:           str   = "coarse",
+        augment:        bool  = False,
+        noise_prob:     float = 0.02,
+        with_position:  bool  = False,
+        rejection_prob: float = 0.0,
     ):
         assert len(fragments) == len(labels)
         assert mode == "coarse" or mode.startswith("specialist:")
+        if with_position and mode != "coarse":
+            raise ValueError("with_position only supported in coarse mode")
+        if rejection_prob > 0 and mode == "coarse":
+            raise ValueError("rejection_prob only supported in specialist mode")
 
-        self.mode       = mode
-        self.augment    = augment
-        self.noise_prob = noise_prob
-        target_group    = mode.split(":")[1] if ":" in mode else None
+        self.mode           = mode
+        self.augment        = augment
+        self.noise_prob     = noise_prob
+        self.with_position  = with_position
+        self.rejection_prob = rejection_prob
+        # Use Python's `random` module — it is auto-reseeded per DataLoader worker.
+
+        target_group = mode.split(":")[1] if ":" in mode else None
 
         if target_group is not None:
             keep = [
                 i for i, lbl in enumerate(labels)
                 if TYPE_TO_GROUP.get(lbl) == target_group
             ]
-            self.fragments = fragments[keep]
-            self.labels    = [labels[i] for i in keep]
-            self.label_map = GROUP_LOCAL_IDX[target_group]
+            self.fragments    = fragments[keep]
+            self.labels       = [labels[i] for i in keep]
+            self.label_map    = GROUP_LOCAL_IDX[target_group]
+            self.num_local    = len(GROUPS[target_group])
+            self.target_group = target_group
+
+            if rejection_prob > 0:
+                # Out-of-group pool: every sample whose group ≠ target.
+                # Stored as a view into the original fragments array (no copy).
+                out_keep = [
+                    i for i, lbl in enumerate(labels)
+                    if TYPE_TO_GROUP.get(lbl) != target_group
+                ]
+                if not out_keep:
+                    raise RuntimeError(
+                        f"rejection_prob>0 but no out-of-group samples available "
+                        f"for group {target_group}"
+                    )
+                self._out_fragments = fragments[out_keep]
+            else:
+                self._out_fragments = None
         else:
-            self.fragments = fragments
-            self.labels    = labels
-            self.label_map = GROUP_TO_IDX
+            self.fragments    = fragments
+            self.labels       = labels
+            self.label_map    = GROUP_TO_IDX
+            self.num_local    = None
+            self.target_group = None
+            self._out_fragments = None
 
     def __len__(self) -> int:
         return len(self.fragments)
 
-    def __getitem__(self, idx: int):
-        x = torch.from_numpy(self.fragments[idx].astype(np.int64))
-
+    def _augment(self, x: torch.Tensor) -> torch.Tensor:
         if self.augment and self.noise_prob > 0:
-            # Salt-and-pepper byte corruption: random bytes override ~noise_prob
-            # of positions.  Byte values stay in [0, 255].
             mask  = torch.rand(x.shape) < self.noise_prob
             noise = torch.randint_like(x, 0, 256)
             x     = torch.where(mask, noise, x)
+        return x
+
+    def __getitem__(self, idx: int):
+        # Rejection-class injection (specialist mode only).
+        if self._out_fragments is not None and random.random() < self.rejection_prob:
+            out_idx = random.randrange(len(self._out_fragments))
+            x = torch.from_numpy(self._out_fragments[out_idx].astype(np.int64))
+            x = self._augment(x)
+            y = self.num_local                          # rejection class index
+            return x, y
+
+        x = torch.from_numpy(self.fragments[idx].astype(np.int64))
+        x = self._augment(x)
 
         if self.mode == "coarse":
-            group = TYPE_TO_GROUP[self.labels[idx]]
-            y = self.label_map[group]
-        else:
-            y = self.label_map[self.labels[idx]]
+            label_str = self.labels[idx]
+            y = self.label_map[TYPE_TO_GROUP[label_str]]
+            if self.with_position:
+                # is_header is computed on the *clean* fragment header before
+                # augmentation could corrupt the magic bytes.
+                raw = bytes(self.fragments[idx][:_MAX_MAGIC_LEN].tolist())
+                is_header = _is_header_for_label(raw, label_str)
+                return x, y, is_header
+            return x, y
 
+        # specialist mode (no rejection draw)
+        y = self.label_map[self.labels[idx]]
         return x, y
 
 # ---------------------------------------------------------------------------
@@ -1155,66 +1494,123 @@ def train_cascade(
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(
+def _evaluate_batches(
     cascade: HierarchicalCascade,
-    fragments: np.ndarray,
-    labels: list[str],
-    batch_size: int = 512,
+    iter_batches,                       # iterable of (x_tensor, labels_list)
+    soft_top_k: int = 3,
 ) -> dict:
     """
-    Returns per-stage accuracy:
-      - coarse_acc: how often Stage 1 predicted the correct group
-      - fine_acc:   end-to-end fine-grained accuracy
-      - oracle_fine_acc: fine accuracy when Stage 1 is assumed perfect
-                         (upper bound — isolates specialist quality)
+    Shared evaluation engine for both in-RAM and lazy variants.
+
+    Reports:
+      - coarse_acc:        Stage 1 top-1 group accuracy
+      - coarse_topk_acc:   Stage 1 top-K group accuracy (K=soft_top_k); upper
+                           bound on what soft routing can recover
+      - fine_acc:          end-to-end accuracy with hard cascade (argmax)
+      - soft_fine_acc:     end-to-end accuracy with soft (top-K MoE) routing
+      - oracle_fine_acc:   fine accuracy with perfect coarse routing
     """
     device = next(cascade.coarse.parameters()).device
     cascade.eval()
 
-    coarse_correct = fine_correct = oracle_correct = total = 0
+    coarse_correct = coarse_topk_correct = 0
+    fine_correct = soft_correct = oracle_correct = total = 0
 
-    for start in range(0, len(fragments), batch_size):
-        batch_frags  = fragments[start:start + batch_size]
-        batch_labels = labels[start:start + batch_size]
-        x = torch.from_numpy(batch_frags.astype(np.int64)).to(device)
+    for x, batch_labels in iter_batches:
+        x = x.to(device)
+        B = x.shape[0]
 
         with torch.no_grad():
-            group_logits = cascade.coarse(x)
-            group_preds  = group_logits.argmax(dim=-1)
+            group_logits = cascade.coarse(x)                  # (B, 11)
+            group_preds  = group_logits.argmax(dim=-1)        # (B,)
+            _, topk_idx  = group_logits.topk(soft_top_k, dim=-1)  # (B, K)
 
-        for i, (lbl, g_pred_idx) in enumerate(zip(batch_labels, group_preds.tolist())):
-            true_group = TYPE_TO_GROUP.get(lbl)
-            pred_group = GROUP_NAMES[g_pred_idx]
-            coarse_correct += int(pred_group == true_group)
-            total += 1
+            # Soft routing predictions for the whole batch in one shot
+            soft_preds, _ = cascade.predict_soft(x, top_k=soft_top_k)
 
-            # Oracle: use true group to route (upper bound for specialist)
+        # True group indices per sample (-1 if label is missing from mapping)
+        true_group_idx = torch.tensor([
+            GROUP_TO_IDX.get(TYPE_TO_GROUP.get(lbl, ""), -1)
+            for lbl in batch_labels
+        ], device=device)
+
+        coarse_correct      += (group_preds == true_group_idx).sum().item()
+        coarse_topk_correct += (topk_idx == true_group_idx.unsqueeze(-1)).any(dim=-1).sum().item()
+
+        # Oracle (true group → its specialist)
+        for true_g_name in set(TYPE_TO_GROUP[l] for l in batch_labels):
+            mask = [i for i, l in enumerate(batch_labels) if TYPE_TO_GROUP[l] == true_g_name]
+            if not mask:
+                continue
+            mask_t = torch.tensor(mask, device=device)
             with torch.no_grad():
-                oracle_logits = cascade.specialists[true_group](x[i:i+1])
-                oracle_pred   = GROUPS[true_group][oracle_logits.argmax(-1).item()]
-            oracle_correct += int(oracle_pred == lbl)
+                oracle_logits = cascade.specialists[true_g_name](x[mask_t])
+            num_local = len(GROUPS[true_g_name])
+            oracle_pred_idx = oracle_logits[:, :num_local].argmax(dim=-1).tolist()
+            local_types = GROUPS[true_g_name]
+            oracle_correct += sum(
+                int(local_types[oracle_pred_idx[k]] == batch_labels[mask[k]])
+                for k in range(len(mask))
+            )
 
-            # Real cascade: use predicted group to route
+        # Hard cascade — group by predicted group for batched specialist forward
+        for g_idx, g_name in enumerate(GROUP_NAMES):
+            sel = (group_preds == g_idx).nonzero(as_tuple=True)[0]
+            if sel.numel() == 0:
+                continue
             with torch.no_grad():
-                spec_logits = cascade.specialists[pred_group](x[i:i+1])
-                fine_pred   = GROUPS[pred_group][spec_logits.argmax(-1).item()]
-            fine_correct += int(fine_pred == lbl)
+                spec_logits = cascade.specialists[g_name](x[sel])
+            num_local = len(GROUPS[g_name])
+            local_pred_idx = spec_logits[:, :num_local].argmax(dim=-1).tolist()
+            local_types = GROUPS[g_name]
+            sel_list = sel.tolist()
+            for k, sample_idx in enumerate(sel_list):
+                if local_types[local_pred_idx[k]] == batch_labels[sample_idx]:
+                    fine_correct += 1
+
+        # Soft routing accuracy
+        for i, lbl in enumerate(batch_labels):
+            if soft_preds[i] == lbl:
+                soft_correct += 1
+
+        total += B
 
     return {
-        "coarse_acc":      coarse_correct / total,
-        "fine_acc":        fine_correct   / total,
-        "oracle_fine_acc": oracle_correct / total,
-        "total_samples":   total,
+        "coarse_acc":       coarse_correct      / total,
+        "coarse_topk_acc":  coarse_topk_correct / total,
+        "fine_acc":         fine_correct        / total,
+        "soft_fine_acc":    soft_correct        / total,
+        "oracle_fine_acc":  oracle_correct      / total,
+        "total_samples":    total,
+        "soft_top_k":       soft_top_k,
     }
 
 
-def evaluate_lazy(
-    cascade: HierarchicalCascade,
-    frag_path: Path,
-    file_indices: np.ndarray,
-    labels: list[str],
-    sector_size: int,
+def evaluate(
+    cascade:    HierarchicalCascade,
+    fragments:  np.ndarray,
+    labels:     list[str],
     batch_size: int = 512,
+    soft_top_k: int = 3,
+) -> dict:
+    """
+    In-RAM evaluation.  See _evaluate_batches for metric definitions.
+    """
+    def batches():
+        for start in range(0, len(fragments), batch_size):
+            x = torch.from_numpy(fragments[start:start + batch_size].astype(np.int64))
+            yield x, labels[start:start + batch_size]
+    return _evaluate_batches(cascade, batches(), soft_top_k=soft_top_k)
+
+
+def evaluate_lazy(
+    cascade:      HierarchicalCascade,
+    frag_path:    Path,
+    file_indices: np.ndarray,
+    labels:       list[str],
+    sector_size:  int,
+    batch_size:   int = 512,
+    soft_top_k:   int = 3,
 ) -> dict:
     """
     Same metrics as evaluate() but reads fragments on demand via memmap.
@@ -1223,46 +1619,14 @@ def evaluate_lazy(
     total_n = frag_path.stat().st_size // sector_size
     mm = np.memmap(frag_path, dtype=np.uint8, mode="r", shape=(total_n, sector_size))
 
-    device = next(cascade.coarse.parameters()).device
-    cascade.eval()
+    def batches():
+        for start in range(0, len(file_indices), batch_size):
+            end      = min(start + batch_size, len(file_indices))
+            batch_fi = file_indices[start:end]
+            x = torch.from_numpy(np.ascontiguousarray(mm[batch_fi]).astype(np.int64))
+            yield x, labels[start:end]
 
-    coarse_correct = fine_correct = oracle_correct = total = 0
-    n = len(file_indices)
-
-    for start in range(0, n, batch_size):
-        end          = min(start + batch_size, n)
-        batch_fi     = file_indices[start:end]
-        batch_labels = labels[start:end]
-
-        batch_frags = mm[batch_fi]                          # pages in only these rows
-        x = torch.from_numpy(batch_frags.astype(np.int64)).to(device)
-
-        with torch.no_grad():
-            group_logits = cascade.coarse(x)
-            group_preds  = group_logits.argmax(dim=-1)
-
-        for i, (lbl, g_pred_idx) in enumerate(zip(batch_labels, group_preds.tolist())):
-            true_group = TYPE_TO_GROUP.get(lbl)
-            pred_group = GROUP_NAMES[g_pred_idx]
-            coarse_correct += int(pred_group == true_group)
-            total += 1
-
-            with torch.no_grad():
-                oracle_logits = cascade.specialists[true_group](x[i:i+1])
-                oracle_pred   = GROUPS[true_group][oracle_logits.argmax(-1).item()]
-            oracle_correct += int(oracle_pred == lbl)
-
-            with torch.no_grad():
-                spec_logits = cascade.specialists[pred_group](x[i:i+1])
-                fine_pred   = GROUPS[pred_group][spec_logits.argmax(-1).item()]
-            fine_correct += int(fine_pred == lbl)
-
-    return {
-        "coarse_acc":      coarse_correct / total,
-        "fine_acc":        fine_correct   / total,
-        "oracle_fine_acc": oracle_correct / total,
-        "total_samples":   total,
-    }
+    return _evaluate_batches(cascade, batches(), soft_top_k=soft_top_k)
 
 
 # ---------------------------------------------------------------------------

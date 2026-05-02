@@ -106,47 +106,78 @@ def load_group_data(
     fraction: Optional[float],
     binary_dir: Path,
     seed: int = 42,
+    include_out_group: bool = False,
+    out_group_per_class: Optional[int] = None,
 ) -> tuple[np.ndarray, list[str]]:
-    """Load split, filter to one group, optionally subsample per fine-grained class."""
-    # mmap=True: the fragment file is memory-mapped rather than read entirely into
-    # RAM.  Only the pages for the rows in `keep` are faulted in from disk, so
-    # loading is proportional to the number of samples kept, not to the total
-    # dataset size.  This makes smoke-test runs (--max-per-class 500) load in
-    # seconds instead of waiting for a multi-GB file to copy into RAM.
+    """
+    Load split, filter to this group's classes (optionally also keeping a
+    sub-sample of out-of-group fragments so the rejection class can be
+    materialised at training time).
+
+    Args:
+        include_out_group:    when True, the returned arrays also contain
+                              out-of-group fragments (their labels stay
+                              unchanged; the dataset wrapper handles the
+                              rejection mapping).  Required for the
+                              `--rejection-class` Phase 2 mode.
+        out_group_per_class:  per-class hard cap on out-of-group samples.
+                              Defaults to max_per_class (if set) so the
+                              out-of-group pool is comparable in size to
+                              the in-group pool.
+    """
     fragments, label_indices, all_types = load_split(split, mmap=True, binary_dir=binary_dir)
     labels = label_indices_to_strings(label_indices, all_types)
 
-    # Filter to this group's fine-grained classes
-    keep = [i for i, lbl in enumerate(labels) if TYPE_TO_GROUP.get(lbl) == group]
-    if not keep:
+    in_keep  = [i for i, lbl in enumerate(labels) if TYPE_TO_GROUP.get(lbl) == group]
+    if not in_keep:
         return np.empty((0, fragments.shape[1]), dtype=fragments.dtype), []
-    fragments = fragments[keep]
-    labels    = [labels[i] for i in keep]
+    out_keep = (
+        [i for i, lbl in enumerate(labels) if TYPE_TO_GROUP.get(lbl) != group]
+        if include_out_group else []
+    )
 
+    rng = np.random.default_rng(seed)
+
+    # ---- Sub-sample in-group, per fine-grained class -----------------------
     if max_per_class is None and fraction is not None:
         if not 0.0 < fraction <= 1.0:
             raise ValueError(f"fraction must be in (0, 1], got {fraction}")
-        local_map   = GROUP_LOCAL_IDX[group]
-        local_idxs  = np.array([local_map[lbl] for lbl in labels])
-        counts      = np.bincount(local_idxs)
-        min_count   = int(counts[counts > 0].min())
+        local_map  = GROUP_LOCAL_IDX[group]
+        in_local   = np.array([local_map[labels[i]] for i in in_keep])
+        counts     = np.bincount(in_local)
+        min_count  = int(counts[counts > 0].min())
         max_per_class = max(1, round(min_count * fraction))
 
     if max_per_class is not None:
-        local_map  = GROUP_LOCAL_IDX[group]
-        local_idxs = np.array([local_map[lbl] for lbl in labels])
-        rng  = np.random.default_rng(seed)
-        keep2: list[int] = []
-        for cls_idx in np.unique(local_idxs):
-            idx = np.where(local_idxs == cls_idx)[0]
+        local_map = GROUP_LOCAL_IDX[group]
+        in_local  = np.array([local_map[labels[i]] for i in in_keep])
+        in_keep_arr = np.array(in_keep)
+        kept: list[int] = []
+        for cls_idx in np.unique(in_local):
+            idx = np.where(in_local == cls_idx)[0]
             if len(idx) > max_per_class:
                 idx = rng.choice(idx, size=max_per_class, replace=False)
-            keep2.extend(idx.tolist())
-        keep_arr  = np.array(sorted(keep2))
-        fragments = fragments[keep_arr]
-        labels    = [labels[i] for i in keep_arr]
+            kept.extend(in_keep_arr[idx].tolist())
+        in_keep = sorted(kept)
 
-    return fragments, labels
+    # ---- Sub-sample out-of-group, per fine-grained class -------------------
+    if out_keep:
+        if out_group_per_class is None:
+            out_group_per_class = max_per_class
+        if out_group_per_class is not None:
+            out_keep_arr = np.array(out_keep)
+            out_labels   = np.array([labels[i] for i in out_keep])
+            kept: list[int] = []
+            for cls_name in np.unique(out_labels):
+                idx = np.where(out_labels == cls_name)[0]
+                if len(idx) > out_group_per_class:
+                    idx = rng.choice(idx, size=out_group_per_class, replace=False)
+                kept.extend(out_keep_arr[idx].tolist())
+            out_keep = sorted(kept)
+
+    final_keep = sorted(set(in_keep) | set(out_keep))
+    keep_arr = np.array(final_keep)
+    return fragments[keep_arr], [labels[i] for i in keep_arr]
 
 
 # ---------------------------------------------------------------------------
@@ -254,14 +285,27 @@ def eval_one_epoch(
     loader: DataLoader,
     device: str,
 ) -> tuple[float, float]:
+    """
+    Validation accuracy is measured *only over the in-group classes*.
+
+    Reason: validation samples are all in-group, so we never want the
+    specialist to "predict" the rejection slot at val time.  Restricting
+    argmax to the first num_classes outputs gives the apples-to-apples
+    accuracy that's directly comparable to runs without a rejection class.
+    """
     model.eval()
+    num_local  = model.num_classes
     total_loss = total_correct = total_samples = 0
     for x, y in loader:
         x, y   = x.to(device), y.to(device)
         logits = model(x)
+        # CE loss uses the full output (with rejection slot if present);
+        # this is consistent with how the model was trained.
         loss   = F.cross_entropy(logits, y, reduction="sum")
+        # Accuracy uses only the in-group slots — see docstring.
+        in_group_logits = logits[:, :num_local]
         total_loss    += loss.item()
-        total_correct += (logits.argmax(dim=-1) == y).sum().item()
+        total_correct += (in_group_logits.argmax(dim=-1) == y).sum().item()
         total_samples += len(x)
     return total_loss / total_samples, total_correct / total_samples
 
@@ -276,14 +320,13 @@ def eval_confusion_matrix(
     """
     One val pass → (num_classes, num_classes) int64 confusion matrix.
     conf_mat[true_label, predicted_label] = count.
-    Called only when a new best val_acc is found, so the matrix always
-    corresponds to the best checkpoint without needing to reload weights.
+    Predictions are restricted to in-group slots to match eval_one_epoch.
     """
     model.eval()
     conf_mat = np.zeros((num_classes, num_classes), dtype=np.int64)
     for x, y in loader:
         x, y  = x.to(device), y.to(device)
-        preds = model(x).argmax(dim=-1)
+        preds = model(x)[:, :num_classes].argmax(dim=-1)
         for t, p in zip(y.cpu().tolist(), preds.cpu().tolist()):
             conf_mat[t, p] += 1
     return conf_mat
@@ -354,13 +397,23 @@ def _make_encoder(group: str, grad_checkpoint: bool = False) -> torch.nn.Module:
 
 def _load_encoder_from_phase1(encoder: torch.nn.Module, ckpt_path: Path, device: str) -> None:
     """
-    Extract ByteEncoder weights from a phase1 CoarseClassifier checkpoint and load
-    them into FusedEncoder.byte_enc.  FusedEncoder.bigram_enc has no phase1 equivalent
-    and is left at its random initialisation.
+    Load encoder weights from a phase1 CoarseClassifier checkpoint into the
+    Phase 2 specialist's encoder (FusedEncoder / ArchiveEncoder / TextEncoder).
 
-    Key path translation:
-        phase1 CoarseClassifier  →  FusedEncoder
-        encoder.<key>            →  byte_enc.<key>
+    Two phase1 formats are supported, chosen automatically:
+
+      - **Legacy** (ByteEncoder only): keys live under `encoder.<...>` with no
+        sub-branch prefix.  Maps `encoder.<key>` → `byte_enc.<key>`.
+
+      - **New** (FusedEncoder, possibly with B2I): keys live under
+        `encoder.byte_enc.<...>`, `encoder.bigram_enc.<...>`, and optionally
+        `encoder.b2i_enc.<...>`.  Maps each branch directly into the matching
+        attribute on the specialist encoder; whichever branches exist on both
+        sides are warm-started, the rest are left at random initialisation.
+
+    Position-head keys (`position_head.*`) and the main classification head
+    are intentionally skipped — they belong to the coarse classifier, not to
+    the encoder.
     """
     state    = torch.load(ckpt_path, map_location=device, weights_only=True)
     model_sd = state["model"]
@@ -368,26 +421,43 @@ def _load_encoder_from_phase1(encoder: torch.nn.Module, ckpt_path: Path, device:
     if any(k.startswith("_orig_mod.") for k in model_sd):
         model_sd = {k.removeprefix("_orig_mod."): v for k, v in model_sd.items()}
 
-    # Remap encoder.* → byte_enc.* (ByteEncoder lives at FusedEncoder.byte_enc)
-    encoder_sd = {
-        "byte_enc." + k.removeprefix("encoder."): v
+    # Strip everything that isn't part of `encoder.*`.
+    encoder_only = {
+        k.removeprefix("encoder."): v
         for k, v in model_sd.items()
         if k.startswith("encoder.")
     }
+    if not encoder_only:
+        raise RuntimeError(f"No encoder.* keys found in {ckpt_path}")
 
-    # strict=False: only byte_enc.* is expected to be in the phase1 checkpoint.
-    # All other branches (bigram_enc, header_mlp, hist_mlp, struct_mlp, …) are new
-    # and will be missing — that is correct, they are randomly initialised.
+    # Detect format: a FusedEncoder-style checkpoint has byte_enc/bigram_enc
+    # sub-modules; a legacy ByteEncoder dump has top-level layer names like
+    # `embed.weight`, `stem.0.weight`, `stage1.conv1.weight`, …
+    is_fused = any(
+        k.startswith(("byte_enc.", "bigram_enc.", "b2i_enc."))
+        for k in encoder_only
+    )
+
+    if is_fused:
+        encoder_sd = encoder_only        # already in the right namespace
+    else:
+        # Legacy ByteEncoder → wrap under byte_enc.*
+        encoder_sd = {f"byte_enc.{k}": v for k, v in encoder_only.items()}
+
+    # strict=False: any branch present on the destination but missing in the
+    # source (e.g. bigram_enc, header_mlp, hist_mlp, struct_mlp) is left at
+    # random initialisation — by design.  Any source key not on the
+    # destination is a true mismatch and indicates a config error.
     missing, unexpected = encoder.load_state_dict(encoder_sd, strict=False)
-    unexpected       = [k for k in unexpected if not k.startswith("byte_enc.")]
-    byte_enc_missing = [k for k in missing    if k.startswith("byte_enc.")]
-    if byte_enc_missing or unexpected:
+    if unexpected:
         raise RuntimeError(
-            f"Encoder load mismatch — missing byte_enc keys: {byte_enc_missing}, "
-            f"unexpected: {unexpected}"
+            f"Encoder load mismatch — unexpected keys in phase1 checkpoint: "
+            f"{unexpected[:10]}{'...' if len(unexpected) > 10 else ''}"
         )
-    n_new = len(missing)   # everything missing is a new randomly-init'd branch
-    print(f"  Loaded byte_enc from phase1; {n_new} new-branch tensors randomly initialised")
+
+    loaded_branches = sorted({k.split(".", 1)[0] for k in encoder_sd})
+    print(f"  Loaded branches from phase1: {loaded_branches}; "
+          f"{len(missing)} new-branch tensors randomly initialised")
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +483,7 @@ def train_specialist(
     warmup_pct:      float = 0.05,
     compile_model:   bool  = False,
     cutmix_alpha:    float = 0.0,
+    with_rejection:  bool  = False,
     extra_config:    dict  = {},
 ) -> SpecialistClassifier:
 
@@ -428,7 +499,7 @@ def train_specialist(
         _load_encoder_from_phase1(encoder, phase1_ckpt, device)
         print(f"  [{group}] encoder loaded from {phase1_ckpt.name}")
 
-    model = SpecialistClassifier(encoder, num_classes).to(device)
+    model = SpecialistClassifier(encoder, num_classes, with_rejection=with_rejection).to(device)
 
     if encoder_init == "frozen":
         for p in model.encoder.parameters():
@@ -515,6 +586,7 @@ def train_specialist(
                 "scheduler":       "LinearWarmup+CosineAnnealing",
                 "encoder_init":    encoder_init,
                 "encoder_lr_scale": encoder_lr_scale,
+                "with_rejection":  with_rejection,
                 "amp":             scaler is not None,
                 "compile":         compile_model,
                 "grad_checkpoint": grad_checkpoint,
@@ -662,6 +734,14 @@ if __name__ == "__main__":
     parser.add_argument("--archive-dir",   type=Path,
                         default=Path(__file__).parent / "phase2_archive",
                         help="Archive root; each group gets a sub-folder (default: ./phase2_archive)")
+    parser.add_argument("--rejection-class", action="store_true",
+                        help="Add an out-of-group rejection class to each specialist; "
+                             "trains the model to flag mis-routed inputs and enables "
+                             "soft-routing inference (Mixture-of-Experts marginalization)")
+    parser.add_argument("--rejection-prob", type=float, default=0.15,
+                        help="Probability that any given training sample is replaced "
+                             "by an out-of-group fragment labelled with the rejection "
+                             "class (default: 0.15; only used with --rejection-class)")
     parser.add_argument("--gpu-mem-fraction", type=float, default=None)
     parser.add_argument("--cpu-fraction",     type=float, default=None)
     args = parser.parse_args()
@@ -706,23 +786,33 @@ if __name__ == "__main__":
 
         print(f"  Loading train split for [{group}] ...")
         train_frags, train_labels = load_group_data(
-            "train", group, args.max_per_class, args.fraction, args.binary_dir
+            "train", group, args.max_per_class, args.fraction, args.binary_dir,
+            include_out_group=args.rejection_class,
         )
         if len(train_labels) == 0:
             print(f"  [{group}] no training samples — skipping")
             continue
-        print(f"  {len(train_labels)} fragments, {len(set(train_labels))} classes")
+        n_in  = sum(1 for l in train_labels if TYPE_TO_GROUP.get(l) == group)
+        n_out = len(train_labels) - n_in
+        print(f"  {n_in} in-group + {n_out} out-of-group fragments, "
+              f"{len(set(train_labels))} unique fine-grained classes")
 
         print(f"  Loading val split for [{group}] ...")
         val_frags, val_labels = load_group_data(
-            "val", group, args.max_per_class, args.fraction, args.binary_dir
+            "val", group, args.max_per_class, args.fraction, args.binary_dir,
+            include_out_group=False,
         )
         print(f"  {len(val_labels)} fragments, {len(set(val_labels))} classes")
 
-        train_ds = FragmentDataset(train_frags, train_labels, mode=f"specialist:{group}",
-                                   augment=True, noise_prob=args.noise_prob)
-        val_ds   = FragmentDataset(val_frags,   val_labels,   mode=f"specialist:{group}",
-                                   augment=False)
+        train_ds = FragmentDataset(
+            train_frags, train_labels, mode=f"specialist:{group}",
+            augment=True, noise_prob=args.noise_prob,
+            rejection_prob=(args.rejection_prob if args.rejection_class else 0.0),
+        )
+        val_ds   = FragmentDataset(
+            val_frags, val_labels, mode=f"specialist:{group}",
+            augment=False,
+        )
 
         train_loader = DataLoader(train_ds, shuffle=True,  **dl_kwargs)
         val_loader   = DataLoader(val_ds,   shuffle=False, **dl_kwargs)
@@ -748,6 +838,7 @@ if __name__ == "__main__":
             warmup_pct       = args.warmup_pct,
             compile_model    = args.compile,
             cutmix_alpha     = args.cutmix_alpha,
+            with_rejection   = args.rejection_class,
             extra_config     = {
                 "group":            group,
                 "max_per_class":    args.max_per_class,
@@ -755,6 +846,10 @@ if __name__ == "__main__":
                 "binary_dir":       str(args.binary_dir),
                 "gpu_mem_fraction": args.gpu_mem_fraction,
                 "cpu_fraction":     args.cpu_fraction,
+                "noise_prob":       args.noise_prob,
+                "rejection_prob":   args.rejection_prob if args.rejection_class else 0.0,
+                "n_in_train":       n_in,
+                "n_out_train":      n_out,
             },
         )
 

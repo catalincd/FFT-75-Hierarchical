@@ -36,6 +36,7 @@ from tqdm import tqdm
 from load_binary import load_split, label_indices_to_strings, BINARY_DIR
 from hierarchical_cascade import (
     ByteEncoder,
+    FusedEncoder,
     CoarseClassifier,
     FragmentDataset,
     TYPE_TO_GROUP,
@@ -111,26 +112,51 @@ def train_one_epoch(
     grad_clip: float = 1.0,
     accum_steps: int = 1,         # gradient accumulation: effective batch = batch_size * accum_steps
     label_smoothing: float = 0.0, # >0 prevents over-confident logits; 0.1 matches paper's training regime
+    position_weight: float = 0.0, # >0 enables auxiliary header/non-header loss (multitask)
 ) -> tuple[float, float]:
+    """
+    One training epoch.
+
+    Multi-task: when position_weight > 0 and the dataloader yields 3-tuples
+    (x, y, pos_y), an auxiliary cross-entropy loss is added on the position
+    head logits.  Total loss = main_loss + position_weight * position_loss.
+    """
     model.train()
     total_loss = total_correct = total_samples = 0
+    pos_total_correct = 0
+    pos_total_loss = 0.0
+    has_position = position_weight > 0
     running_loss = 0.0
     device_type  = device.split(":")[0]
     n_batches    = len(loader)
 
     optimizer.zero_grad()
 
-    for step, (x, y) in enumerate(loader, 1):
+    for step, batch in enumerate(loader, 1):
+        if has_position and len(batch) == 3:
+            x, y, pos_y = batch
+            pos_y = pos_y.to(device, non_blocking=True)
+        else:
+            x, y = batch[0], batch[1]
+            pos_y = None
         x, y = x.to(device), y.to(device)
         is_last   = (step == n_batches)
         do_update = (step % accum_steps == 0) or is_last
 
         with torch.autocast(device_type=device_type, enabled=(scaler is not None)):
-            logits = model(x)
-            # Divide loss so accumulated gradients equal the mean over the full
-            # effective batch (not the sum). Scale by actual remaining steps at
-            # the last incomplete accumulation window.
-            loss   = F.cross_entropy(logits, y, label_smoothing=label_smoothing) / accum_steps
+            if pos_y is not None and getattr(model, "position_head", None) is not None:
+                logits, pos_logits = model.forward_with_position(x)
+            else:
+                logits = model(x)
+                pos_logits = None
+
+            main_loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+            if pos_logits is not None:
+                pos_loss = F.cross_entropy(pos_logits, pos_y)
+                loss     = (main_loss + position_weight * pos_loss) / accum_steps
+            else:
+                pos_loss = None
+                loss     = main_loss / accum_steps
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -156,12 +182,19 @@ def train_one_epoch(
         total_samples += len(x)
         running_loss  += batch_loss
 
-        pbar.set_postfix(
-            loss=f"{running_loss / step:.4f}",
-            acc=f"{total_correct / total_samples:.3f}",
-            lr=f"{optimizer.param_groups[-1]['lr']:.2e}",
-            refresh=False,
-        )
+        if pos_logits is not None:
+            with torch.no_grad():
+                pos_total_correct += (pos_logits.argmax(dim=-1) == pos_y).sum().item()
+                pos_total_loss    += pos_loss.item() * len(x)
+
+        postfix = {
+            "loss": f"{running_loss / step:.4f}",
+            "acc":  f"{total_correct / total_samples:.3f}",
+            "lr":   f"{optimizer.param_groups[-1]['lr']:.2e}",
+        }
+        if pos_logits is not None:
+            postfix["pos_acc"] = f"{pos_total_correct / total_samples:.3f}"
+        pbar.set_postfix(**postfix, refresh=False)
         pbar.update(1)
 
     return total_loss / total_samples, total_correct / total_samples
@@ -175,7 +208,8 @@ def eval_one_epoch(
 ) -> tuple[float, float]:
     model.eval()
     total_loss = total_correct = total_samples = 0
-    for x, y in loader:
+    for batch in loader:
+        x, y = batch[0], batch[1]      # ignore position label if present
         x, y   = x.to(device), y.to(device)
         logits = model(x)
         loss   = F.cross_entropy(logits, y, reduction="sum")
@@ -218,14 +252,28 @@ def train_phase1(
     warmup_pct:      float = 0.05,  # fraction of steps used for LR warmup; paper uses ~2/50 = 0.04
     min_lr:          float = 0.0,   # cosine annealing lower bound (eta_min)
     compile_model:   bool  = False,  # torch.compile: 2-3x throughput on CUDA (PyTorch >= 2.0)
+    use_b2i:         bool  = True,   # add the Byte2Image branch to the coarse encoder
+    use_bigram:      bool  = True,   # add the Bigram branch to the coarse encoder
+    position_head:   bool  = True,   # attach a binary "is_header" auxiliary head
+    position_weight: float = 0.2,    # weight of the auxiliary loss in the total loss
     extra_config:    dict  = {},
 ) -> CoarseClassifier:
 
     archive_dir.mkdir(parents=True, exist_ok=True)
     log_path = archive_dir / "training_log.json"
 
-    encoder   = ByteEncoder(grad_checkpoint=grad_checkpoint)
-    model     = CoarseClassifier(encoder).to(device)
+    # Coarse encoder: by default the full FusedEncoder (CNN + Bigram + Byte2Image).
+    # The coarse classifier is the system bottleneck — every group's end-to-end
+    # accuracy ≈ coarse_acc · specialist_acc.  Giving it the same multi-branch
+    # encoder used by the specialists narrows the cascade-routing error.
+    if use_bigram or use_b2i:
+        encoder = FusedEncoder(
+            use_b2i         = use_b2i,
+            grad_checkpoint = grad_checkpoint,
+        )
+    else:
+        encoder = ByteEncoder(grad_checkpoint=grad_checkpoint)
+    model = CoarseClassifier(encoder, with_position_head=position_head).to(device)
 
     # --- Resume (load before compile so state_dict keys match) ---
     start_epoch = 0
@@ -319,6 +367,10 @@ def train_phase1(
                 "effective_batch": train_loader.batch_size * accum_steps,
                 "device":          device,
                 "batch_size":      train_loader.batch_size,
+                "use_b2i":         use_b2i,
+                "use_bigram":      use_bigram,
+                "position_head":   position_head,
+                "position_weight": position_weight,
                 **extra_config,
             },
             "status":      "in_progress",
@@ -348,6 +400,7 @@ def train_phase1(
                 model, train_loader, optimizer, device, pbar,
                 scaler=scaler, scheduler=scheduler, accum_steps=accum_steps,
                 label_smoothing=label_smoothing,
+                position_weight=(position_weight if position_head else 0.0),
             )
 
         # --- Validate ---
@@ -454,6 +507,16 @@ if __name__ == "__main__":
     parser.add_argument("--archive-dir",   type=Path,
                         default=Path(__file__).parent / "phase1_archive",
                         help="Where to save checkpoints and log (default: ./phase1_archive)")
+    parser.add_argument("--no-b2i",        action="store_true",
+                        help="Disable the Byte2Image branch in the coarse encoder (default: on)")
+    parser.add_argument("--no-bigram",     action="store_true",
+                        help="Disable the Bigram branch (use plain ByteEncoder for coarse)")
+    parser.add_argument("--no-position-head", action="store_true",
+                        help="Disable the auxiliary is_header position head (default: on)")
+    parser.add_argument("--position-weight", type=float, default=0.2,
+                        help="Multitask weight for the position head loss (default: 0.2)")
+    parser.add_argument("--noise-prob",    type=float, default=0.0,
+                        help="Byte-noise augmentation rate during training (default: 0.0)")
     parser.add_argument("--gpu-mem-fraction", type=float, default=None,
                         help="Max fraction of GPU memory to use, e.g. 0.9 for 90%% (default: unlimited)")
     parser.add_argument("--cpu-fraction", type=float, default=None,
@@ -478,6 +541,8 @@ if __name__ == "__main__":
         print(f"CPU threads: {n_threads}/{os.cpu_count()} ({args.cpu_fraction * 100:.0f}%)")
     print(f"Archive: {args.archive_dir}")
 
+    use_position_head = not args.no_position_head
+
     if args.lazy:
         from load_binary_lazy import LazyFragmentDataset, load_split_lazy
 
@@ -499,8 +564,15 @@ if __name__ == "__main__":
         )
         print(f"  {len(val_labels)} fragments, {len(set(val_labels))} classes")
 
-        train_ds = LazyFragmentDataset(train_frag_path, sector, train_indices, train_labels, mode="coarse")
-        val_ds   = LazyFragmentDataset(val_frag_path,   sector, val_indices,   val_labels,   mode="coarse")
+        train_ds = LazyFragmentDataset(
+            train_frag_path, sector, train_indices, train_labels, mode="coarse",
+            augment=(args.noise_prob > 0), noise_prob=args.noise_prob,
+            with_position=use_position_head,
+        )
+        val_ds   = LazyFragmentDataset(
+            val_frag_path, sector, val_indices, val_labels, mode="coarse",
+            augment=False, with_position=False,
+        )
 
     else:
         print(f"Loading train split from {args.binary_dir} ...")
@@ -515,8 +587,13 @@ if __name__ == "__main__":
         )
         print(f"  {len(val_labels)} fragments, {len(set(val_labels))} classes")
 
-        train_ds = FragmentDataset(train_frags, train_labels, mode="coarse")
-        val_ds   = FragmentDataset(val_frags,   val_labels,   mode="coarse")
+        train_ds = FragmentDataset(
+            train_frags, train_labels, mode="coarse",
+            augment=(args.noise_prob > 0), noise_prob=args.noise_prob,
+            with_position=use_position_head,
+        )
+        val_ds   = FragmentDataset(val_frags, val_labels, mode="coarse",
+                                   augment=False, with_position=False)
 
     on_cuda = device.startswith("cuda")
     # persistent_workers: keeps worker processes alive between epochs, avoiding the
@@ -543,6 +620,10 @@ if __name__ == "__main__":
         compile_model    = args.compile,
         accum_steps      = args.grad_accum,
         grad_checkpoint  = args.grad_checkpoint,
+        use_b2i          = not args.no_b2i,
+        use_bigram       = not args.no_bigram,
+        position_head    = use_position_head,
+        position_weight  = args.position_weight,
         device           = device,
         archive_dir      = args.archive_dir,
         resume           = args.resume,
@@ -553,5 +634,6 @@ if __name__ == "__main__":
             "binary_dir":         str(args.binary_dir),
             "gpu_mem_fraction":   args.gpu_mem_fraction,
             "cpu_fraction":       args.cpu_fraction,
+            "noise_prob":         args.noise_prob,
         },
     )
