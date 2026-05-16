@@ -363,22 +363,142 @@ class EntropyBranch(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Coarse encoder — CNN + bigram + entropy, used by the Stage 1 group classifier
+# Structural branch — byte-class ratios + structural-character frequencies
+# ---------------------------------------------------------------------------
+
+# Structural ASCII characters that discriminate text formats. Each character's
+# frequency within a fragment is a strong signal:
+#   JSON  → dense  { } [ ] : "
+#   XML   → dense  < > / =
+#   HTML  → dense  < > / = (+ & entities)
+#   CSV   → dense  ,  and regular \n cadence
+#   log   → dense  :  [ ] and high digit ratio
+#   txt   → low density of all structural chars; mostly alphanumeric + space
+_TEXT_STRUCT_CHARS: list[int] = [
+    # JSON / dict
+    ord('{'), ord('}'), ord('['), ord(']'), ord(':'),
+    # XML / HTML
+    ord('<'), ord('>'), ord('/'), ord('='), ord('&'),
+    # Quoting / strings
+    ord('"'), ord("'"),
+    # CSV / tabular
+    ord(','), ord(';'), ord('|'),
+    # Whitespace patterns
+    ord('\n'), ord('\r'), ord('\t'),
+    # Log / miscellaneous structural
+    ord('#'), ord('@'), ord('\\'), ord('('), ord(')'), ord('!'),
+]   # 23 characters
+
+_TEXT_BIGRAMS: list[tuple[int, int]] = [
+    (ord('"'), ord(':')),   # "key": — JSON key-value (never in CSV)
+    (ord('}'), ord(',')),   # }, — JSON object in array
+    (ord(']'), ord(',')),   # ], — JSON nested array element
+    (ord('<'), ord('/')),   # </tag> — XML/HTML closing tag
+    (ord('='), ord('"')),   # attr=" — XML/HTML attribute value
+    (ord('/'), ord('>')),   # /> — XML/HTML self-closing tag
+    (ord('<'), ord('!')),   # <!-- — HTML comment/DOCTYPE
+    (ord(','), 10),         # ,\n — CSV row-end
+    (10, ord('"')),         # \n" — CSV quoted field at line start
+    (ord(':'), ord(' ')),   # ": " — log timestamps & JSON values
+]   # 10 bigrams
+
+
+class StructuralBranch(nn.Module):
+    """
+    Byte-class ratios + structural-character frequencies → compact feature vector.
+
+    Targets the text↔archive boundary, the dominant Phase 1 error. Entropy alone
+    fails there because `archive` is bimodal — compressed streams are
+    high-entropy, but tar / stored-zip members are not. What separates genuine
+    text from genuine compressed data is:
+      - byte-class ratios: text is ~95-100% printable ASCII; a compressed stream
+        is ~37% (roughly uniform over 0-255), with very different null / control
+        / high-bit fractions;
+      - structural-character frequency: braces, brackets, tags and commas are
+        dense in JSON/XML/HTML/CSV/log and absent from compressed data.
+
+    Both are global position-free statistics, so — like BigramBranch and
+    EntropyBranch — they bypass the CNN's receptive-field build-up.
+    """
+    def __init__(self, out_dim: int = 64):
+        super().__init__()
+        self.out_dim = out_dim
+        # Registered as buffers so they move to the model's device automatically.
+        self.register_buffer(
+            "_struct_chars", torch.tensor(_TEXT_STRUCT_CHARS, dtype=torch.long)
+        )
+        self.register_buffer(
+            "_bigram_a", torch.tensor([a for a, _ in _TEXT_BIGRAMS], dtype=torch.long)
+        )
+        self.register_buffer(
+            "_bigram_b", torch.tensor([b for _, b in _TEXT_BIGRAMS], dtype=torch.long)
+        )
+        in_dim = 7 + len(_TEXT_STRUCT_CHARS) + len(_TEXT_BIGRAMS)  # 7 byte classes + 23 + 10
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, out_dim),
+        )
+
+    @staticmethod
+    def _byte_class_ratios(x: torch.Tensor) -> torch.Tensor:
+        """Per-sample fraction of bytes in 7 discriminative byte classes. (B,L) → (B,7)"""
+        is_ws    = (x == 9) | (x == 10) | (x == 13) | (x == 32)
+        is_print = (x >= 32) & (x <= 126)
+        is_alpha = ((x >= 65) & (x <= 90)) | ((x >= 97) & (x <= 122))
+        is_digit = (x >= 48) & (x <= 57)
+        is_null  = (x == 0)
+        is_high  = (x >= 128)
+        is_ctrl  = ((x < 32) & ~is_ws) | (x == 127)
+        return torch.stack([
+            is_null.float().mean(dim=1),
+            is_ws.float().mean(dim=1),
+            is_print.float().mean(dim=1),
+            is_alpha.float().mean(dim=1),
+            is_digit.float().mean(dim=1),
+            is_high.float().mean(dim=1),
+            is_ctrl.float().mean(dim=1),
+        ], dim=-1)
+
+    def _struct_freq(self, x: torch.Tensor) -> torch.Tensor:
+        """Unigram structural-char occurrence rates. (B,L) → (B, n_chars)"""
+        return (x.unsqueeze(-1) == self._struct_chars).float().mean(dim=1)
+
+    def _bigram_freq(self, x: torch.Tensor) -> torch.Tensor:
+        """Consecutive structural-pair occurrence rates. (B,L) → (B, n_bigrams)"""
+        match_a = (x[:, :-1].unsqueeze(-1) == self._bigram_a)
+        match_b = (x[:, 1:].unsqueeze(-1)  == self._bigram_b)
+        return (match_a & match_b).float().mean(dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L) int64 byte values
+        feats = torch.cat([
+            self._byte_class_ratios(x),
+            self._struct_freq(x),
+            self._bigram_freq(x),
+        ], dim=-1)
+        return self.mlp(feats)
+
+
+# ---------------------------------------------------------------------------
+# Coarse encoder — CNN + bigram + entropy + structural, for the Stage 1 classifier
 # ---------------------------------------------------------------------------
 
 class CoarseEncoder(nn.Module):
     """
     Encoder for the coarse 11-group classifier: ByteEncoder + BigramBranch +
-    EntropyBranch.
+    EntropyBranch + StructuralBranch.
 
     Exposes the same `.out_dim` / `forward(x)` interface as ByteEncoder, so
-    CoarseClassifier needs no change.  The two extra branches are position-free
+    CoarseClassifier needs no change. The three extra branches are position-free
     global statistics that directly expose what the coarse split depends on:
-      - BigramBranch  : byte co-occurrence — compressed vs structured content
-      - EntropyBranch : block-wise Shannon entropy — randomness level + variance
+      - BigramBranch     : byte co-occurrence — compressed vs structured content
+      - EntropyBranch    : block-wise Shannon entropy — randomness level + variance
+      - StructuralBranch : byte-class ratios + structural-char frequency —
+                           sharpens the text vs archive boundary
 
     Default dims: ByteEncoder(F=128) → 1024, BigramBranch → 512,
-    EntropyBranch → 64, total 1600.
+    EntropyBranch → 64, StructuralBranch → 64, total 1664.
     """
     def __init__(
         self,
@@ -387,20 +507,25 @@ class CoarseEncoder(nn.Module):
         bigram_dim:      int  = 512,
         entropy_dim:     int  = 64,
         entropy_blocks:  int  = 16,
+        struct_dim:      int  = 64,
         grad_checkpoint: bool = False,
     ):
         super().__init__()
         self.byte_enc    = ByteEncoder(embed_dim, num_filters, grad_checkpoint)
         self.bigram_enc  = BigramBranch(out_dim=bigram_dim)
         self.entropy_enc = EntropyBranch(out_dim=entropy_dim, n_blocks=entropy_blocks)
-        self.out_dim     = self.byte_enc.out_dim + bigram_dim + entropy_dim
+        self.struct_enc  = StructuralBranch(out_dim=struct_dim)
+        self.out_dim     = (self.byte_enc.out_dim + bigram_dim
+                            + entropy_dim + struct_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, L) int64 byte values
-        cnn_feat     = self.byte_enc(x)                      # (B, 1024)
-        bigram_feat  = self.bigram_enc(x)                    # (B, 512)
-        entropy_feat = self.entropy_enc(x)                   # (B, 64)
-        return torch.cat([cnn_feat, bigram_feat, entropy_feat], dim=-1)
+        return torch.cat([
+            self.byte_enc(x),                                # (B, 1024)
+            self.bigram_enc(x),                              # (B, 512)
+            self.entropy_enc(x),                             # (B, 64)
+            self.struct_enc(x),                              # (B, 64)
+        ], dim=-1)                                           # (B, 1664)
 
 
 # ---------------------------------------------------------------------------
@@ -507,42 +632,7 @@ class ArchiveEncoder(nn.Module):
 # Specialist encoder — Text (txt / csv / xml / json / html / log)
 # ---------------------------------------------------------------------------
 
-# Structural ASCII characters that discriminate text formats.
-# Each character's *frequency* within a 512-byte window is a strong signal:
-#   JSON  → dense  { } [ ] : "
-#   XML   → dense  < > / =
-#   HTML  → dense  < > / = (+ & entities)
-#   CSV   → dense  ,  and regular \n cadence
-#   log   → dense  :  [ ] and high digit ratio
-#   txt   → low density of all structural chars; mostly alphanumeric + space
-_TEXT_STRUCT_CHARS: list[int] = [
-    # JSON / dict
-    ord('{'), ord('}'), ord('['), ord(']'), ord(':'),
-    # XML / HTML
-    ord('<'), ord('>'), ord('/'), ord('='), ord('&'),
-    # Quoting / strings
-    ord('"'), ord("'"),
-    # CSV / tabular
-    ord(','), ord(';'), ord('|'),
-    # Whitespace patterns
-    ord('\n'), ord('\r'), ord('\t'),
-    # Log / miscellaneous structural
-    ord('#'), ord('@'), ord('\\'), ord('('), ord(')'), ord('!'),
-]   # 23 characters
-
-_TEXT_BIGRAMS: list[tuple[int, int]] = [
-    (ord('"'), ord(':')),   # "key": — JSON key-value (never in CSV)
-    (ord('}'), ord(',')),   # }, — JSON object in array
-    (ord(']'), ord(',')),   # ], — JSON nested array element
-    (ord('<'), ord('/')),   # </tag> — XML/HTML closing tag
-    (ord('='), ord('"')),   # attr=" — XML/HTML attribute value
-    (ord('/'), ord('>')),   # /> — XML/HTML self-closing tag
-    (ord('<'), ord('!')),   # <!-- — HTML comment/DOCTYPE
-    (ord(','), 10),         # ,\n — CSV row-end
-    (10, ord('"')),         # \n" — CSV quoted field at line start
-    (ord(':'), ord(' ')),   # ": " — log timestamps & JSON values
-]   # 10 bigrams
-
+# _TEXT_STRUCT_CHARS / _TEXT_BIGRAMS are defined above with StructuralBranch.
 
 class TextEncoder(nn.Module):
     """
