@@ -34,6 +34,8 @@ class LazyFragmentDataset(Dataset):
                       to use (supports subsampling without loading fragments)
         labels:       list[str] of fine-grained type names, length M
         mode:         "coarse" | "specialist:<group>"
+        augment:      enable byte-noise augmentation (training only)
+        noise_prob:   fraction of bytes to randomly corrupt per sample
     """
 
     def __init__(
@@ -43,6 +45,8 @@ class LazyFragmentDataset(Dataset):
         file_indices: np.ndarray,
         labels: list[str],
         mode: str = "coarse",
+        augment: bool = False,
+        noise_prob: float = 0.02,
     ):
         assert mode == "coarse" or mode.startswith("specialist:")
         assert len(file_indices) == len(labels)
@@ -50,6 +54,8 @@ class LazyFragmentDataset(Dataset):
         self.frag_path   = Path(frag_path)
         self.sector_size = sector_size
         self.mode        = mode
+        self.augment     = augment
+        self.noise_prob  = noise_prob
         self._fh         = None     # opened lazily per worker
 
         target_group = mode.split(":")[1] if ":" in mode else None
@@ -76,6 +82,14 @@ class LazyFragmentDataset(Dataset):
         self._fh.seek(int(self.file_indices[idx]) * self.sector_size)
         raw = self._fh.read(self.sector_size)
         x = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(torch.int64)
+
+        if self.augment and self.noise_prob > 0:
+            # Salt-and-pepper byte corruption: random bytes override ~noise_prob
+            # of positions.  Re-rolled every fetch, so each epoch sees a slightly
+            # different corrupted form of the same fragment.
+            mask  = torch.rand(x.shape) < self.noise_prob
+            noise = torch.randint_like(x, 0, 256)
+            x     = torch.where(mask, noise, x)
 
         if self.mode == "coarse":
             group = TYPE_TO_GROUP[self.labels[idx]]

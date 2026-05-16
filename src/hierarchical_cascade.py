@@ -11,6 +11,7 @@ This mirrors the FFT-75 scenario structure:
 """
 
 import json
+import math
 import time
 import torch
 from datetime import datetime
@@ -296,6 +297,110 @@ class FusedEncoder(nn.Module):
         cnn_feat    = self.byte_enc(x)                       # (B, 1024)
         bigram_feat = self.bigram_enc(x)                     # (B, 512)
         return torch.cat([cnn_feat, bigram_feat], dim=-1)    # (B, 1536)
+
+
+# ---------------------------------------------------------------------------
+# Entropy branch — block-wise Shannon entropy
+# ---------------------------------------------------------------------------
+
+def block_entropy(x: torch.Tensor, n_blocks: int) -> torch.Tensor:
+    """
+    Per-block normalised Shannon entropy.  x: (B, L) int64  →  (B, n_blocks) float32.
+
+    The sequence is split into n_blocks contiguous blocks; each block's byte
+    histogram gives an entropy in bits/byte (0-8), returned scaled to 0-1.
+
+    xlogy(p, p) is used instead of p * log(p) so empty histogram bins
+    (p = 0) contribute exactly 0 rather than 0 * -inf = NaN — this matters
+    under AMP where a small additive epsilon would underflow to zero.
+    """
+    B, L = x.shape
+    blk  = L // n_blocks
+    xb   = x[:, :blk * n_blocks].reshape(B, n_blocks, blk).long()
+    hist = torch.zeros(B, n_blocks, 256, device=x.device, dtype=torch.float32)
+    hist.scatter_add_(2, xb, torch.ones_like(xb, dtype=torch.float32))
+    p    = hist / blk
+    ent  = -torch.special.xlogy(p, p).sum(dim=-1) / math.log(2)   # bits/byte, 0-8
+    return ent / 8.0                                              # → 0-1
+
+
+class EntropyBranch(nn.Module):
+    """
+    Block-wise Shannon entropy → compact feature vector.
+
+    Motivation: entropy is the classic file-fragment discriminator.  Compressed
+    and media formats (archive, jpg/png, video, audio) sit near 8 bits/byte;
+    text, executables and documents are lower and more structured.  Crucially,
+    per-block entropy also exposes *variance*: a PDF interleaves low-entropy
+    text streams with high-entropy embedded images, so its block entropies
+    spread out, whereas a pure compressed stream is uniformly high.  The CNN
+    can only infer this slowly through receptive-field expansion; providing it
+    explicitly as its own branch short-circuits that.
+
+    Features fed to the MLP: the n_blocks per-block entropies plus four
+    summary statistics (mean, std, min, max) of that vector.
+    """
+    def __init__(self, out_dim: int = 64, n_blocks: int = 16):
+        super().__init__()
+        self.out_dim  = out_dim
+        self.n_blocks = n_blocks
+        self.mlp = nn.Sequential(
+            nn.Linear(n_blocks + 4, 128),
+            nn.GELU(),
+            nn.Linear(128, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L) int64 byte values
+        ent   = block_entropy(x, self.n_blocks)              # (B, n_blocks)
+        stats = torch.stack([
+            ent.mean(dim=1),
+            ent.std(dim=1),
+            ent.amin(dim=1),
+            ent.amax(dim=1),
+        ], dim=-1)                                            # (B, 4)
+        return self.mlp(torch.cat([ent, stats], dim=-1))      # (B, out_dim)
+
+
+# ---------------------------------------------------------------------------
+# Coarse encoder — CNN + bigram + entropy, used by the Stage 1 group classifier
+# ---------------------------------------------------------------------------
+
+class CoarseEncoder(nn.Module):
+    """
+    Encoder for the coarse 11-group classifier: ByteEncoder + BigramBranch +
+    EntropyBranch.
+
+    Exposes the same `.out_dim` / `forward(x)` interface as ByteEncoder, so
+    CoarseClassifier needs no change.  The two extra branches are position-free
+    global statistics that directly expose what the coarse split depends on:
+      - BigramBranch  : byte co-occurrence — compressed vs structured content
+      - EntropyBranch : block-wise Shannon entropy — randomness level + variance
+
+    Default dims: ByteEncoder(F=128) → 1024, BigramBranch → 512,
+    EntropyBranch → 64, total 1600.
+    """
+    def __init__(
+        self,
+        embed_dim:       int  = 16,
+        num_filters:     int  = 128,
+        bigram_dim:      int  = 512,
+        entropy_dim:     int  = 64,
+        entropy_blocks:  int  = 16,
+        grad_checkpoint: bool = False,
+    ):
+        super().__init__()
+        self.byte_enc    = ByteEncoder(embed_dim, num_filters, grad_checkpoint)
+        self.bigram_enc  = BigramBranch(out_dim=bigram_dim)
+        self.entropy_enc = EntropyBranch(out_dim=entropy_dim, n_blocks=entropy_blocks)
+        self.out_dim     = self.byte_enc.out_dim + bigram_dim + entropy_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L) int64 byte values
+        cnn_feat     = self.byte_enc(x)                      # (B, 1024)
+        bigram_feat  = self.bigram_enc(x)                    # (B, 512)
+        entropy_feat = self.entropy_enc(x)                   # (B, 64)
+        return torch.cat([cnn_feat, bigram_feat, entropy_feat], dim=-1)
 
 
 # ---------------------------------------------------------------------------

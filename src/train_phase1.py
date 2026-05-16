@@ -1,7 +1,9 @@
 """
 Phase 1 Coarse Classifier Training — standalone, crash-safe.
 
-Trains only the coarse 11-group classifier (ByteEncoder + CoarseClassifier).
+Trains only the coarse 11-group classifier (CoarseEncoder + CoarseClassifier).
+CoarseEncoder = ByteEncoder (CNN) + BigramBranch (byte co-occurrence) +
+EntropyBranch (block-wise Shannon entropy).
 After every epoch it:
   - saves a model checkpoint  -> phase1_archive/epoch_{N:04d}.pt
   - atomically updates a JSON -> phase1_archive/training_log.json
@@ -23,10 +25,12 @@ Usage:
 """
 
 import json
+import random
 import time
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -35,7 +39,7 @@ from tqdm import tqdm
 
 from load_binary import load_split, label_indices_to_strings, BINARY_DIR
 from hierarchical_cascade import (
-    ByteEncoder,
+    CoarseEncoder,
     CoarseClassifier,
     FragmentDataset,
     TYPE_TO_GROUP,
@@ -111,6 +115,9 @@ def train_one_epoch(
     grad_clip: float = 1.0,
     accum_steps: int = 1,         # gradient accumulation: effective batch = batch_size * accum_steps
     label_smoothing: float = 0.0, # >0 prevents over-confident logits; 0.1 matches paper's training regime
+    class_weights=None,           # (NUM_GROUPS,) tensor; rebalances under-represented groups
+    cutmix_alpha: float = 0.0,    # Beta(alpha, alpha) byte CutMix; 0 disables
+    ema_model=None,               # AveragedModel updated after each optimizer step
 ) -> tuple[float, float]:
     model.train()
     total_loss = total_correct = total_samples = 0
@@ -125,12 +132,36 @@ def train_one_epoch(
         is_last   = (step == n_batches)
         do_update = (step % accum_steps == 0) or is_last
 
+        # Byte CutMix: splice a contiguous region from a shuffled copy of the
+        # batch into x, mix labels proportionally. Splicing (not interpolating)
+        # is the only valid mix for integer byte sequences; it teaches the model
+        # that fragments straddling two formats deserve uncertain predictions.
+        # Applied to 50% of batches so the rest still see clean signal.
+        y_mix, lam_eff = y, 1.0
+        if cutmix_alpha > 0 and random.random() < 0.5:
+            B, L     = x.shape
+            lam      = np.random.beta(cutmix_alpha, cutmix_alpha)
+            cut_size = int(L * (1 - lam))
+            if cut_size > 0:
+                start   = random.randint(0, L - cut_size)
+                j       = torch.randperm(B, device=device)
+                x       = x.clone()
+                x[:, start:start + cut_size] = x[j, start:start + cut_size]
+                y_mix   = y[j]
+                lam_eff = 1.0 - cut_size / L   # actual λ after integer truncation
+
         with torch.autocast(device_type=device_type, enabled=(scaler is not None)):
             logits = model(x)
             # Divide loss so accumulated gradients equal the mean over the full
             # effective batch (not the sum). Scale by actual remaining steps at
             # the last incomplete accumulation window.
-            loss   = F.cross_entropy(logits, y, label_smoothing=label_smoothing) / accum_steps
+            if lam_eff < 1.0:
+                loss = (
+                    lam_eff       * F.cross_entropy(logits, y,     weight=class_weights, label_smoothing=label_smoothing) +
+                    (1 - lam_eff) * F.cross_entropy(logits, y_mix, weight=class_weights, label_smoothing=label_smoothing)
+                ) / accum_steps
+            else:
+                loss = F.cross_entropy(logits, y, weight=class_weights, label_smoothing=label_smoothing) / accum_steps
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -149,6 +180,8 @@ def train_one_epoch(
             optimizer.zero_grad()
             if scheduler is not None:
                 scheduler.step()
+            if ema_model is not None:
+                ema_model.update_parameters(model)
 
         batch_loss     = loss.item() * accum_steps          # unscale for display
         total_loss    += batch_loss * len(x)
@@ -282,14 +315,30 @@ def train_phase1(
     warmup_pct:      float = 0.05,  # fraction of steps used for LR warmup; paper uses ~2/50 = 0.04
     min_lr:          float = 0.0,   # cosine annealing lower bound (eta_min)
     compile_model:   bool  = False,  # torch.compile: 2-3x throughput on CUDA (PyTorch >= 2.0)
+    class_weights=None,             # (NUM_GROUPS,) tensor; rebalances under-represented groups
+    cutmix_alpha:    float = 0.0,   # Beta(alpha, alpha) byte CutMix; 0 disables
+    ema_decay:       float = 0.999, # exponential moving average decay for the weight-averaged model
     extra_config:    dict  = {},
 ) -> CoarseClassifier:
 
     archive_dir.mkdir(parents=True, exist_ok=True)
     log_path = archive_dir / "training_log.json"
 
-    encoder   = ByteEncoder(grad_checkpoint=grad_checkpoint)
+    encoder   = CoarseEncoder(grad_checkpoint=grad_checkpoint)
     model     = CoarseClassifier(encoder).to(device)
+
+    # EMA of the weights, updated after every optimizer step. The averaged copy
+    # is evaluated alongside the raw model each epoch; whichever scores higher on
+    # val becomes best.pt. use_buffers=True so BatchNorm running stats average too.
+    # Built before torch.compile so the deep-copy never touches a compiled graph.
+    ema_model = AveragedModel(
+        model,
+        multi_avg_fn = get_ema_multi_avg_fn(ema_decay),
+        use_buffers  = True,
+    )
+
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
 
     # --- Resume (load before compile so state_dict keys match) ---
     start_epoch = 0
@@ -348,6 +397,8 @@ def train_phase1(
                 scheduler.load_state_dict(state["scheduler"])
             if scaler is not None and "scaler" in state:
                 scaler.load_state_dict(state["scaler"])
+            if "ema" in state:
+                ema_model.load_state_dict(state["ema"])
             print(f"Resumed from {ckpt.name}  (epoch {start_epoch})")
         else:
             print("No checkpoint found in archive — starting fresh.")
@@ -383,6 +434,10 @@ def train_phase1(
                 "effective_batch": train_loader.batch_size * accum_steps,
                 "device":          device,
                 "batch_size":      train_loader.batch_size,
+                "encoder":         "CoarseEncoder",
+                "cutmix_alpha":    cutmix_alpha,
+                "ema_decay":       ema_decay,
+                "class_weighted":  class_weights is not None,
                 **extra_config,
             },
             "status":      "in_progress",
@@ -411,29 +466,40 @@ def train_phase1(
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, optimizer, device, pbar,
                 scaler=scaler, scheduler=scheduler, accum_steps=accum_steps,
-                label_smoothing=label_smoothing,
+                label_smoothing=label_smoothing, class_weights=class_weights,
+                cutmix_alpha=cutmix_alpha, ema_model=ema_model,
             )
 
-        # --- Validate ---
-        val_loss, val_acc = eval_one_epoch(model, val_loader, device)
+        # --- Validate raw model and EMA model; the better one becomes best.pt ---
+        val_loss,     val_acc     = eval_one_epoch(model,     val_loader, device)
+        ema_val_loss, ema_val_acc = eval_one_epoch(ema_model, val_loader, device)
+
+        if ema_val_acc >= val_acc:
+            cand_model, cand_acc, cand_loss, cand_src = ema_model, ema_val_acc, ema_val_loss, "ema"
+        else:
+            cand_model, cand_acc, cand_loss, cand_src = model, val_acc, val_loss, "raw"
 
         elapsed = time.time() - ep_start
         print(
-            f"  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}"
-            f"  ({_fmt_time(elapsed)})"
+            f"  val_acc={val_acc:.4f}  ema_val_acc={ema_val_acc:.4f}"
+            f"  (best={cand_src} {cand_acc:.4f}, {_fmt_time(elapsed)})"
         )
 
-        # --- Save model checkpoint ---
+        # --- Save model checkpoint (raw + EMA weights) ---
         ckpt_path = archive_dir / f"epoch_{ep_num:04d}.pt"
         ckpt_data = {
-            "epoch":      ep_num,
-            "model":      model.state_dict(),
-            "optimizer":  optimizer.state_dict(),
-            "scheduler":  scheduler.state_dict(),
-            "train_loss": train_loss,
-            "train_acc":  train_acc,
-            "val_loss":   val_loss,
-            "val_acc":    val_acc,
+            "epoch":        ep_num,
+            "model":        model.state_dict(),
+            "ema":          ema_model.state_dict(),
+            "optimizer":    optimizer.state_dict(),
+            "scheduler":    scheduler.state_dict(),
+            "train_loss":   train_loss,
+            "train_acc":    train_acc,
+            "val_loss":     val_loss,
+            "val_acc":      val_acc,
+            "ema_val_loss": ema_val_loss,
+            "ema_val_acc":  ema_val_acc,
+            "best_source":  cand_src,   # which key ("model"/"ema") holds the better weights
         }
         if scaler is not None:
             ckpt_data["scaler"] = scaler.state_dict()
@@ -441,37 +507,41 @@ def train_phase1(
 
         # --- Update JSON log ---
         epoch_record = {
-            "epoch":      ep_num,
-            "train_loss": round(train_loss, 6),
-            "train_acc":  round(train_acc,  6),
-            "val_loss":   round(val_loss,   6),
-            "val_acc":    round(val_acc,    6),
-            "lr":         round(optimizer.param_groups[-1]["lr"], 8),
-            "elapsed_s":  round(elapsed, 2),
-            "timestamp":  datetime.now().isoformat(),
-            "checkpoint": ckpt_path.name,
+            "epoch":        ep_num,
+            "train_loss":   round(train_loss, 6),
+            "train_acc":    round(train_acc,  6),
+            "val_loss":     round(val_loss,   6),
+            "val_acc":      round(val_acc,    6),
+            "ema_val_loss": round(ema_val_loss, 6),
+            "ema_val_acc":  round(ema_val_acc,  6),
+            "lr":           round(optimizer.param_groups[-1]["lr"], 8),
+            "elapsed_s":    round(elapsed, 2),
+            "timestamp":    datetime.now().isoformat(),
+            "checkpoint":   ckpt_path.name,
         }
         log["epochs"].append(epoch_record)
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if cand_acc > best_val_acc:
+            best_val_acc = cand_acc
             log["best"] = {
                 "epoch":    ep_num,
-                "val_acc":  round(val_acc,  6),
-                "val_loss": round(val_loss, 6),
+                "val_acc":  round(cand_acc,  6),
+                "val_loss": round(cand_loss, 6),
+                "source":   cand_src,
             }
-            # Keep a symlink / copy named best.pt for easy access
+            # best.pt points at the epoch checkpoint; best_source in the
+            # checkpoint says whether the "model" or "ema" key is the winner.
             best_path = archive_dir / "best.pt"
             if best_path.exists() or best_path.is_symlink():
                 best_path.unlink()
             best_path.symlink_to(ckpt_path.name)
 
-            # Confusion matrix — computed here so it always matches the best
-            # checkpoint without needing to reload weights after the loop.
-            conf_mat = eval_confusion_matrix(model, val_loader, device, NUM_GROUPS)
+            # Confusion matrix — computed on the winning model so it always
+            # matches best.pt without needing to reload weights after the loop.
+            conf_mat = eval_confusion_matrix(cand_model, val_loader, device, NUM_GROUPS)
             log["confusion_matrix"]         = conf_mat.tolist()
             log["confusion_matrix_classes"] = GROUP_NAMES
-            print("\n  val confusion matrix (row=true, col=pred):")
+            print(f"\n  val confusion matrix [{cand_src}] (row=true, col=pred):")
             for line in format_confusion_matrix(conf_mat, GROUP_NAMES).split("\n"):
                 print(f"    {line}")
             print()
@@ -532,6 +602,16 @@ if __name__ == "__main__":
                         help="Max fraction of GPU memory to use, e.g. 0.9 for 90%% (default: unlimited)")
     parser.add_argument("--cpu-fraction", type=float, default=None,
                         help="Fraction of CPU cores for PyTorch to use, e.g. 0.5 for 50%% (default: all)")
+    parser.add_argument("--noise-prob",   type=float, default=0.02,
+                        help="Fraction of bytes to randomly corrupt per training sample (default: 0.02)")
+    parser.add_argument("--no-augment",   action="store_true",
+                        help="Disable byte-noise augmentation on the train split")
+    parser.add_argument("--cutmix-alpha", type=float, default=0.0,
+                        help="Beta-distribution alpha for byte CutMix; 0 disables (default: 0.0)")
+    parser.add_argument("--ema-decay",    type=float, default=0.999,
+                        help="EMA decay for the weight-averaged model evaluated alongside the raw one (default: 0.999)")
+    parser.add_argument("--no-class-weights", action="store_true",
+                        help="Disable group-balanced cross-entropy weighting")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -573,8 +653,11 @@ if __name__ == "__main__":
         )
         print(f"  {len(val_labels)} fragments, {len(set(val_labels))} classes")
 
-        train_ds = LazyFragmentDataset(train_frag_path, sector, train_indices, train_labels, mode="coarse")
-        val_ds   = LazyFragmentDataset(val_frag_path,   sector, val_indices,   val_labels,   mode="coarse")
+        train_ds = LazyFragmentDataset(train_frag_path, sector, train_indices, train_labels,
+                                       mode="coarse", augment=not args.no_augment,
+                                       noise_prob=args.noise_prob)
+        val_ds   = LazyFragmentDataset(val_frag_path,   sector, val_indices,   val_labels,
+                                       mode="coarse", augment=False)
 
     else:
         print(f"Loading train split from {args.binary_dir} ...")
@@ -589,8 +672,9 @@ if __name__ == "__main__":
         )
         print(f"  {len(val_labels)} fragments, {len(set(val_labels))} classes")
 
-        train_ds = FragmentDataset(train_frags, train_labels, mode="coarse")
-        val_ds   = FragmentDataset(val_frags,   val_labels,   mode="coarse")
+        train_ds = FragmentDataset(train_frags, train_labels, mode="coarse",
+                                   augment=not args.no_augment, noise_prob=args.noise_prob)
+        val_ds   = FragmentDataset(val_frags,   val_labels,   mode="coarse", augment=False)
 
     on_cuda = device.startswith("cuda")
     # persistent_workers: keeps worker processes alive between epochs, avoiding the
@@ -605,6 +689,21 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_ds, shuffle=True,  **dl_kwargs)
     val_loader   = DataLoader(val_ds,   shuffle=False, **dl_kwargs)
 
+    # Group-balanced class weights. load_data caps samples per fine-grained
+    # *type*, but groups hold 3-7 types each, so big groups stay over-represented
+    # in the coarse label distribution. weight_g ∝ 1 / count_g rebalances the loss.
+    class_weights = None
+    if not args.no_class_weights:
+        group_counts = np.zeros(NUM_GROUPS, dtype=np.float64)
+        for lbl in train_ds.labels:
+            group_counts[GROUP_TO_IDX[TYPE_TO_GROUP[lbl]]] += 1
+        safe_counts   = np.clip(group_counts, 1.0, None)
+        weights       = safe_counts.sum() / (NUM_GROUPS * safe_counts)
+        class_weights = torch.tensor(weights, dtype=torch.float32)
+        print("  group sample counts: " + ", ".join(
+            f"{g}={int(c)}" for g, c in zip(GROUP_NAMES, group_counts)
+        ))
+
     train_phase1(
         train_loader     = train_loader,
         val_loader       = val_loader,
@@ -617,6 +716,9 @@ if __name__ == "__main__":
         compile_model    = args.compile,
         accum_steps      = args.grad_accum,
         grad_checkpoint  = args.grad_checkpoint,
+        class_weights    = class_weights,
+        cutmix_alpha     = args.cutmix_alpha,
+        ema_decay        = args.ema_decay,
         device           = device,
         archive_dir      = args.archive_dir,
         resume           = args.resume,
@@ -627,5 +729,7 @@ if __name__ == "__main__":
             "binary_dir":         str(args.binary_dir),
             "gpu_mem_fraction":   args.gpu_mem_fraction,
             "cpu_fraction":       args.cpu_fraction,
+            "augment":            not args.no_augment,
+            "noise_prob":         args.noise_prob,
         },
     )
