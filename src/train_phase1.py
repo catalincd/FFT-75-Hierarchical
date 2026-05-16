@@ -42,7 +42,6 @@ from hierarchical_cascade import (
     CoarseEncoder,
     CoarseClassifier,
     FragmentDataset,
-    TYPE_TO_GROUP,
     GROUP_TO_IDX,
     GROUP_NAMES,
     NUM_GROUPS,
@@ -115,7 +114,7 @@ def train_one_epoch(
     grad_clip: float = 1.0,
     accum_steps: int = 1,         # gradient accumulation: effective batch = batch_size * accum_steps
     label_smoothing: float = 0.0, # >0 prevents over-confident logits; 0.1 matches paper's training regime
-    class_weights=None,           # (NUM_GROUPS,) tensor; rebalances under-represented groups
+    class_weights=None,           # (NUM_GROUPS,) CE weight tensor; <1 entries down-weight a class
     cutmix_alpha: float = 0.0,    # Beta(alpha, alpha) byte CutMix; 0 disables
     ema_model=None,               # AveragedModel updated after each optimizer step
 ) -> tuple[float, float]:
@@ -315,7 +314,7 @@ def train_phase1(
     warmup_pct:      float = 0.05,  # fraction of steps used for LR warmup; paper uses ~2/50 = 0.04
     min_lr:          float = 0.0,   # cosine annealing lower bound (eta_min)
     compile_model:   bool  = False,  # torch.compile: 2-3x throughput on CUDA (PyTorch >= 2.0)
-    class_weights=None,             # (NUM_GROUPS,) tensor; rebalances under-represented groups
+    class_weights=None,             # (NUM_GROUPS,) CE weight tensor; <1 entries down-weight a class
     cutmix_alpha:    float = 0.0,   # Beta(alpha, alpha) byte CutMix; 0 disables
     ema_decay:       float = 0.999, # exponential moving average decay for the weight-averaged model
     extra_config:    dict  = {},
@@ -437,7 +436,6 @@ def train_phase1(
                 "encoder":         "CoarseEncoder",
                 "cutmix_alpha":    cutmix_alpha,
                 "ema_decay":       ema_decay,
-                "class_weighted":  class_weights is not None,
                 **extra_config,
             },
             "status":      "in_progress",
@@ -610,8 +608,9 @@ if __name__ == "__main__":
                         help="Beta-distribution alpha for byte CutMix; 0 disables (default: 0.0)")
     parser.add_argument("--ema-decay",    type=float, default=0.999,
                         help="EMA decay for the weight-averaged model evaluated alongside the raw one (default: 0.999)")
-    parser.add_argument("--no-class-weights", action="store_true",
-                        help="Disable group-balanced cross-entropy weighting")
+    parser.add_argument("--disk-image-weight", type=float, default=0.6,
+                        help="Cross-entropy weight for the disk_image group; <1 down-weights this "
+                             "container-format class (default: 0.6; 1.0 = no reweighting)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -689,20 +688,17 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_ds, shuffle=True,  **dl_kwargs)
     val_loader   = DataLoader(val_ds,   shuffle=False, **dl_kwargs)
 
-    # Group-balanced class weights. load_data caps samples per fine-grained
-    # *type*, but groups hold 3-7 types each, so big groups stay over-represented
-    # in the coarse label distribution. weight_g ∝ 1 / count_g rebalances the loss.
-    class_weights = None
-    if not args.no_class_weights:
-        group_counts = np.zeros(NUM_GROUPS, dtype=np.float64)
-        for lbl in train_ds.labels:
-            group_counts[GROUP_TO_IDX[TYPE_TO_GROUP[lbl]]] += 1
-        safe_counts   = np.clip(group_counts, 1.0, None)
-        weights       = safe_counts.sum() / (NUM_GROUPS * safe_counts)
-        class_weights = torch.tensor(weights, dtype=torch.float32)
-        print("  group sample counts: " + ", ".join(
-            f"{g}={int(c)}" for g, c in zip(GROUP_NAMES, group_counts)
-        ))
+    # disk_image is a container format: a fragment from inside an ISO/IMG/VMDK can
+    # be byte-identical to the text / exe / archive content stored within it, so at
+    # the coarse level disk_image behaves as an uncertainty "black hole" that
+    # swallows other classes (epoch-1 matrix: 16% precision, attracting 20-62% of
+    # six other groups). Down-weighting it in the loss makes Phase 1 claim
+    # disk_image only for confidently-structural fragments (filesystem metadata,
+    # volume descriptors) and lets ambiguous content fragments fall through to
+    # their true class. All other groups keep weight 1.0.
+    class_weights = torch.ones(NUM_GROUPS, dtype=torch.float32)
+    class_weights[GROUP_TO_IDX["disk_image"]] = args.disk_image_weight
+    print(f"  cross-entropy class weights: disk_image={args.disk_image_weight}, others=1.0")
 
     train_phase1(
         train_loader     = train_loader,
@@ -731,5 +727,6 @@ if __name__ == "__main__":
             "cpu_fraction":       args.cpu_fraction,
             "augment":            not args.no_augment,
             "noise_prob":         args.noise_prob,
+            "disk_image_weight":  args.disk_image_weight,
         },
     )

@@ -34,23 +34,28 @@ echo "Data:     $BINARY_DIR"
 echo "Archive:  $ARCHIVE_DIR"
 echo ""
 
-# --epochs 30: conservative so the cosine LR schedule completes inside ~5h even
-#   if epochs run slow. Truncating a 50-epoch schedule leaves the LR high and the
-#   model worse than a fully-annealed shorter run.
+# --epochs 30: conservative so the cosine LR schedule completes inside ~5h.
+#   Truncating the schedule leaves the LR high and the model worse than a
+#   fully-annealed shorter run.
 # --lr 1e-3 + --min-lr 1e-5: matches the regime that produced the 87% baseline.
-# --grad-accum 2 + --grad-checkpoint: effective batch 1024 with memory headroom
-#   for the added bigram branch at 4096-byte fragments.
+# --batch-size 1024: one real batch, no gradient accumulation. Fits comfortably
+#   in 95 GB VRAM and keeps the effective batch at the proven 1024, so lr needs
+#   no rescaling. No --grad-checkpoint: with this much VRAM, recomputing encoder
+#   activations in backward would only be a ~30% compute tax for memory we have.
 # --cutmix-alpha 0.2: mild byte CutMix; byte-noise augmentation is on by default.
+# --disk-image-weight 0.6: disk_image (iso/img/vmdk) is a container format whose
+#   fragments are byte-identical to embedded content. A mild CE down-weight keeps
+#   Phase 1 from over-claiming it without collapsing its recall (the epoch-2
+#   matrix showed the over-prediction largely self-corrects as features sharpen).
 PYTHONPATH=src python src/train_phase1.py \
-  --binary-dir     "$BINARY_DIR" \
-  --archive-dir    "$ARCHIVE_DIR" \
-  --epochs         30 \
-  --batch-size     512 \
-  --lr             1e-3 \
-  --min-lr         1e-5 \
-  --grad-accum     2 \
-  --grad-checkpoint \
+  --binary-dir        "$BINARY_DIR" \
+  --archive-dir       "$ARCHIVE_DIR" \
+  --epochs            30 \
+  --batch-size        1024 \
+  --lr                1e-3 \
+  --min-lr            1e-5 \
   --compile \
-  --cutmix-alpha   0.2 \
+  --cutmix-alpha      0.2 \
+  --disk-image-weight 0.6 \
   --lazy \
   "$@"
