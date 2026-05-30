@@ -1,0 +1,41 @@
+{
+  "session_id": "20260415_123721",
+  "started_at": "2026-04-15T12:37:21.237029",
+  "group": "image_raster",
+  "num_classes": 6,
+  "config": {
+    "epochs": 5,
+    "lr": 0.001,
+    "min_lr": 1e-05,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "label_smoothing": 0.1,
+    "warmup_pct": 0.05,
+    "optimizer": "AdamW",
+    "scheduler": "LinearWarmup+CosineAnnealing",
+    "encoder_init": "from-phase1",
+    "amp": true,
+    "compile": false,
+    "grad_checkpoint": false,
+    "accum_steps": 1,
+    "effective_batch": 256,
+    "device": "cuda",
+    "batch_size": 256,
+    "group": "image_raster",
+    "max_per_class": 500,
+    "fraction": null,
+    "binary_dir": "../../source/4k_1/binary",
+    "gpu_mem_fraction": null,
+    "cpu_fraction": null
+  },
+  "status": "in_progress",
+  "best": {
+    "epoch": null,
+    "val_acc": null,
+    "val_loss": null
+  },
+  "epochs": []
+}

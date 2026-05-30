@@ -1,0 +1,20 @@
+Specialist Results
+Group	Classes	Specialist Acc	End-to-End Acc	Status
+audio	6	94.89%	82.56%	complete
+video	6	99.94%	86.95%	complete
+image_raster	6	99.81%	86.83%	complete
+image_raw	5	99.88%	86.90%	complete
+document	7	94.11%	81.87%	complete
+archive	6	66.38%	57.75%	complete
+text	6	66.39%	57.76%	complete
+executable	5	98.65%	85.83%	complete
+other	5	99.09%	86.21%	complete
+disk_image	3	99.31%	86.40%	complete
+database	3	95.12%	82.75%	complete
+Total System Accuracy
+Weighted by number of classes (58 total leaf classes):
+
+
+Total = Σ(num_classes × end_to_end_acc) / 58
+      = 46.063 / 58
+      ≈ 79.4%

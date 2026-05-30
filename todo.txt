@@ -1,0 +1,49 @@
+git clone https://github.com/catalincd/FFT-75-Hierarchical.git
+cd FFT-75-Hierarchical/
+
+
+hf auth login
+hf download T0karev/fft75-bin --repo-type dataset --local-dir data/4k_1/binary
+
+
+mkdir phase1_full
+hf download T0karev/my-model best.pt --local-dir phase1_full/
+
+
+
+
+old
+====================
+
+python train_phase2.py \
+  --phase1-checkpoint ./phase1_full/best.pt \
+  --encoder-init from-phase1 \
+  --epochs 20 --batch-size 1024 --lr 1e-4 --min-lr 1e-6 \
+  --weight-decay 0.1 --label-smoothing 0.2 --warmup-pct 0.2 \
+  --grad-accum 2 --grad-checkpoint --compile \
+  --archive-dir ./phase2_full --binary-dir data/4k_1/binary --group archive
+
+
+new
+=============
+python train_phase1.py \
+  --binary-dir ../data/4k_1/binary \
+  --archive-dir ../phase1_full \
+  --epochs 30 --batch-size 512 --lr 1e-3 --min-lr 1e-5 \
+  --weight-decay 0.01 --label-smoothing 0.1 --warmup-pct 0.05 \
+  --grad-accum 2 --grad-checkpoint --compile \
+  --position-weight 0.2 --noise-prob 0.02
+
+=============
+
+python train_phase2.py \
+  --phase1-checkpoint ../phase1_full/best.pt \
+  --encoder-init from-phase1 \
+  --epochs 20 --batch-size 1024 --lr 1e-4 --min-lr 1e-6 \
+  --weight-decay 0.1 --label-smoothing 0.2 --warmup-pct 0.2 \
+  --grad-accum 2 --grad-checkpoint --compile \
+  --archive-dir ../phase2_full --binary-dir ../data/4k_1/binary \
+  --rejection-class --rejection-prob 0.15
+
+
+

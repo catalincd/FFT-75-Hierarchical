@@ -1,0 +1,17 @@
+Ignore multifrag, just focus on FFT 75, document it,
+document the model architecture used
+make sure to talk about entropy and file type determination
+get the strong points of models and the weak points
+explain how this could be used in the real world, for example
+for defragmenting HDD clusters
+document how cascading works, why it is better,
+document the current results
+document the challenges, with imply separating text/csv, archive, data_images and so ON, 
+focusing on confusion matrices
+there is an ongoing effort in generating new data for this, that could improve accuracy;
+assume a 2% gain and speak about it
+
+
+IMPORTANT
+LEAVE DEEP TECHNICAL DETAILS ALONE, THIS POSTER SHOULD BE READABLE BY NON-TECHNICAL PEOPLE,
+IN A VERY COMPREHENSIVE BUT NOT EXHAUSTIVE MANNER 
