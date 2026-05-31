@@ -1,49 +1,88 @@
+===========================================
+Phase 1 (heavy) — run on a fresh vast.ai box
+===========================================
+
+# 1. Clone + deps
 git clone https://github.com/catalincd/FFT-75-Hierarchical.git
 cd FFT-75-Hierarchical/
+pip install -q -r requirements.txt
 
 
+# 2. HF auth
 hf auth login
+
+
+# 3. Dataset (~25 GB train + ~3 GB val)
 hf download T0karev/fft75-bin --repo-type dataset --local-dir data/4k_1/binary
 
 
-mkdir phase1_full
-hf download T0karev/my-model best.pt --local-dir phase1_full/
+# 4. (optional) prior training_log.json — seeds the confusion-cost matrix
+#    Skip if you don't have one — trainer falls back to uniform off-diagonal cost.
+mkdir -p phase1_full
+hf download T0karev/my-model training_log.json --local-dir phase1_full/ || true
 
 
+# 5. Train (full data, 30 epochs)
+#    ByteEncoder = CNN stages + Bi-GRU + attention pool
+#    Loss      = ConfusionWeightedCE (per-class smoothing + off-diagonal penalty)
+#    Augment   = GBFlip (per-bit Gaussian noise) + CutMix
+#    Old checkpoints (data-old/best.pt) do NOT load — encoder shape changed.
+bash scripts/train_phase1.sh
 
 
-old
-====================
+# 6. Upload checkpoints + log
+hf upload T0karev/my-model checkpoints/phase1_archive/best.pt \
+  best.pt --repo-type model
+hf upload T0karev/my-model checkpoints/phase1_archive/training_log.json \
+  training_log.json --repo-type model
 
-python train_phase2.py \
-  --phase1-checkpoint ./phase1_full/best.pt \
-  --encoder-init from-phase1 \
-  --epochs 20 --batch-size 1024 --lr 1e-4 --min-lr 1e-6 \
+
+=================
+Tuning knobs (forwarded to train_phase1.py)
+=================
+
+# Push harder on confusion (text<->archive leaking?)
+bash scripts/train_phase1.sh --confusion-lambda 1.0
+
+# Stronger GBFlip
+bash scripts/train_phase1.sh --gbflip-sigma 0.02 --gbflip-max-rate 0.08
+
+# Less aggressive container smoothing if disk_image recall stays poor
+bash scripts/train_phase1.sh --container-smoothing 0.1
+
+# Quick smoke test (1/10th data, 5 epochs)
+bash scripts/train_phase1.sh --fraction 0.10 --epochs 5
+
+# Resume after a crash
+bash scripts/train_phase1.sh --resume
+
+
+=================
+Phase 2 (specialists) — once Phase 1 is good
+=================
+
+python src/train_phase2.py \
+  --phase1-checkpoint  checkpoints/phase1_archive/best.pt \
+  --encoder-init       from-phase1 \
+  --epochs             20 --batch-size 1024 \
+  --lr 1e-4 --min-lr 1e-6 \
   --weight-decay 0.1 --label-smoothing 0.2 --warmup-pct 0.2 \
   --grad-accum 2 --grad-checkpoint --compile \
-  --archive-dir ./phase2_full --binary-dir data/4k_1/binary --group archive
+  --archive-dir        checkpoints/phase2_archive \
+  --binary-dir         data/4k_1/binary
 
 
-new
-=============
-python train_phase1.py \
-  --binary-dir ../data/4k_1/binary \
-  --archive-dir ../phase1_full \
-  --epochs 30 --batch-size 512 --lr 1e-3 --min-lr 1e-5 \
-  --weight-decay 0.01 --label-smoothing 0.1 --warmup-pct 0.05 \
-  --grad-accum 2 --grad-checkpoint --compile \
-  --position-weight 0.2 --noise-prob 0.02
+=================
+What to expect
+=================
 
-=============
+* Phase 1 model: CoarseEncoder + CoarseClassifier, ~12-15M params now
+  (BiGRU adds ~1.5M to the previous 10M backbone).
+* Per-epoch wall-clock: ~20-45 min on a single mid-range GPU.
+* Total training time: ~10-22 h for 30 epochs.
+* Target val_acc: 88-92% on the 11-group coarse split. The previous
+  recipe (without BiGRU/GBFlip/container smoothing/confusion penalty)
+  capped at ~87% per the repo README; the new bits should add 1-4pp.
 
-python train_phase2.py \
-  --phase1-checkpoint ../phase1_full/best.pt \
-  --encoder-init from-phase1 \
-  --epochs 20 --batch-size 1024 --lr 1e-4 --min-lr 1e-6 \
-  --weight-decay 0.1 --label-smoothing 0.2 --warmup-pct 0.2 \
-  --grad-accum 2 --grad-checkpoint --compile \
-  --archive-dir ../phase2_full --binary-dir ../data/4k_1/binary \
-  --rejection-class --rejection-prob 0.15
-
-
-
+best.pt symlinks to the highest-val_acc epoch. training_log.json contains
+the per-epoch table + the confusion matrix from the best epoch.

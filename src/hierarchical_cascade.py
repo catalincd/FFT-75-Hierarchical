@@ -146,17 +146,39 @@ class AttentionPool1d(nn.Module):
 
 class ByteEncoder(nn.Module):
     """
-    Residual CNN byte encoder inspired by ByteResNet (2024) and JSANet (2024).
+    Residual CNN + Bi-GRU byte encoder.
 
-    Improvements over the original FiFTy backbone:
+    CNN stack inherited from ByteResNet (2024) and JSANet (2024):
       - Residual connections prevent gradient vanishing in deeper stacks
       - SE channel attention recalibrates feature maps after each residual block
       - GELU activations + BatchNorm for faster, more stable convergence
-      - 5-stage progressive downsampling; AttentionPool1d handles 512 or 4096 bytes
-      - Larger embedding dim (16 vs 8) encodes richer byte co-occurrence patterns
+      - 4-stage progressive downsampling -> (B, F*8, L/64)
+
+    On top of that:
+      - 1x1 conv projects F*8 -> gru_input (cheap channel mixer, keeps GRU
+        compute bounded)
+      - 2-layer Bi-GRU runs over the L/64-step sequence -> captures rhythm
+        of byte structure (tag bursts, delimiter cadence, header locality)
+      - AttentionPool1d collapses the GRU output to a single (B, gru_out) vector
+
+    The GRU is the textbook fix for the text<->archive boundary: text formats
+    have a *structural rhythm* (csv comma cadence, html tag bursts, json
+    brace/colon alternation) that the CNN can only see via receptive-field
+    build-up and the structural-char branch can only see as global frequencies.
+
+    out_dim defaults to 384 (2 * gru_hidden=192). CoarseEncoder's total dim
+    becomes 384 + 512 + 64 + 64 = 1024 (was 1664 with the old CNN-only path).
     """
-    def __init__(self, embed_dim: int = 16, num_filters: int = 128,
-                 grad_checkpoint: bool = False):
+    def __init__(
+        self,
+        embed_dim:       int  = 16,
+        num_filters:     int  = 128,
+        grad_checkpoint: bool = False,
+        gru_proj:        int  = 256,   # channels fed into the BiGRU after the 1x1 projection
+        gru_hidden:      int  = 192,
+        gru_layers:      int  = 2,
+        gru_dropout:     float = 0.2,
+    ):
         super().__init__()
         F = num_filters
         self.embed          = nn.Embedding(256, embed_dim)
@@ -193,12 +215,26 @@ class ByteEncoder(nn.Module):
             ResConvBlock(F*8, F*8, kernel_size=3),
         )
 
-        self.pool    = AttentionPool1d(F * 8)               # weighted spatial collapse
-        self.out_dim = F * 8                                # 1024
+        # 1x1 conv: F*8 (=1024) -> gru_proj. Cheap channel mixer; keeps the
+        # GRU input size manageable so the recurrence cost stays bounded.
+        self.gru_proj = nn.Conv1d(F * 8, gru_proj, kernel_size=1)
+        self.gru_norm = nn.BatchNorm1d(gru_proj)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, L) int64 byte values
-        x = self.embed(x).permute(0, 2, 1)                 # (B, embed_dim, L)
+        # Bi-GRU over the L/64-step sequence. With L=4096 that's 64 steps,
+        # with L=512 that's 8 — both small enough for cheap recurrence.
+        self.gru = nn.GRU(
+            input_size    = gru_proj,
+            hidden_size   = gru_hidden,
+            num_layers    = gru_layers,
+            batch_first   = True,
+            bidirectional = True,
+            dropout       = gru_dropout if gru_layers > 1 else 0.0,
+        )
+        gru_out = gru_hidden * 2
+        self.pool    = AttentionPool1d(gru_out)
+        self.out_dim = gru_out
+
+    def _cnn_forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
         if self.grad_checkpoint and self.training:
             # Recompute stage activations during backward instead of storing them.
@@ -212,7 +248,17 @@ class ByteEncoder(nn.Module):
             x = self.pool2(self.stage2(x))
             x = self.pool3(self.stage3(x))
             x = self.stage4(x)
-        return self.pool(x)                                 # (B, out_dim)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L) int64 byte values
+        x = self.embed(x).permute(0, 2, 1)                  # (B, embed_dim, L)
+        x = self._cnn_forward(x)                            # (B, F*8, L/64)
+        x = F.gelu(self.gru_norm(self.gru_proj(x)))         # (B, gru_proj, L/64)
+        x = x.permute(0, 2, 1).contiguous()                 # (B, T, gru_proj)
+        x, _ = self.gru(x)                                  # (B, T, 2*gru_hidden)
+        # AttentionPool1d takes (B, d, T) — permute back.
+        return self.pool(x.permute(0, 2, 1).contiguous())   # (B, out_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -984,6 +1030,40 @@ def load_data(
 # Dataset
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# GBFlip — Gaussian Bit-Flip augmentation
+# ---------------------------------------------------------------------------
+
+def gbflip_uint8(
+    block: np.ndarray,
+    sigma: float,
+    max_rate: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Flip a Gaussian-distributed fraction of bits.
+
+    Per-fragment flip rate = clip(|N(0, sigma)|, 0, max_rate). With sigma=0.01
+    and max_rate=0.05, mean ~ 0.008, ceiling 5%. Models the real bit-error
+    process of storage media and is the de-facto file-fragment augmentation
+    in XMP, CarveFormer, and ByteSCAN.
+    """
+    if sigma <= 0.0:
+        return block
+    rate = float(min(abs(rng.normal(0.0, sigma)), max_rate))
+    L    = block.size
+    n_bits = int(rate * L * 8)
+    if n_bits == 0:
+        return block
+
+    out  = block.copy()
+    bit  = rng.integers(0, L * 8, size=n_bits, dtype=np.int64)
+    byte = (bit >> 3).astype(np.int64)
+    msk  = (np.uint8(1) << (bit & 7).astype(np.uint8))
+    np.bitwise_xor.at(out, byte, msk)
+    return out
+
+
 class FragmentDataset(Dataset):
     """
     Dataset wrapper for FFT-75 style data with optional byte-level augmentation.
@@ -992,29 +1072,37 @@ class FragmentDataset(Dataset):
               fine-grained labels as list of type strings length N.
 
     Augmentation (training only, set augment=True):
-        Byte noise — randomly replaces `noise_prob` fraction of bytes with
-        uniformly random values (0-255) each time a sample is fetched.
-        Because the DataLoader re-fetches every epoch, the same fragment
-        appears in a slightly different corrupted form every epoch, giving
-        the model effectively infinite variations of each training example.
-        This prevents memorisation of exact byte patterns without requiring
-        any additional real data.
+      * GBFlip (gbflip_sigma > 0): per-bit Gaussian flip noise — preferred,
+        matches the storage-media error model used in the file-fragment lit.
+      * Byte noise (noise_prob > 0, gbflip_sigma=0, legacy): random byte
+        replacement, kept for backward compatibility.
+
+    Re-rolled every fetch, so the same fragment appears in a slightly
+    different perturbed form every epoch — effectively infinite variations
+    of each training example.
     """
     def __init__(
         self,
-        fragments:  np.ndarray,
-        labels:     list[str],
-        mode:       str   = "coarse",   # "coarse" | "specialist:<group>"
-        augment:    bool  = False,      # enable byte-noise augmentation
-        noise_prob: float = 0.02,       # fraction of bytes to corrupt per sample
+        fragments:       np.ndarray,
+        labels:          list[str],
+        mode:            str   = "coarse",   # "coarse" | "specialist:<group>"
+        augment:         bool  = False,      # master switch
+        noise_prob:      float = 0.02,       # legacy byte-noise fraction
+        gbflip_sigma:    float = 0.0,        # >0 -> use GBFlip (preferred)
+        gbflip_max_rate: float = 0.05,
+        seed:            int   = 0,
     ):
         assert len(fragments) == len(labels)
         assert mode == "coarse" or mode.startswith("specialist:")
 
-        self.mode       = mode
-        self.augment    = augment
-        self.noise_prob = noise_prob
-        target_group    = mode.split(":")[1] if ":" in mode else None
+        self.mode            = mode
+        self.augment         = augment
+        self.noise_prob      = noise_prob
+        self.gbflip_sigma    = float(gbflip_sigma)
+        self.gbflip_max_rate = float(gbflip_max_rate)
+        self._seed           = int(seed)
+        self._rng            = None    # lazy per-worker numpy RNG
+        target_group         = mode.split(":")[1] if ":" in mode else None
 
         if target_group is not None:
             keep = [
@@ -1029,15 +1117,31 @@ class FragmentDataset(Dataset):
             self.labels    = labels
             self.label_map = GROUP_TO_IDX
 
+    def _get_rng(self) -> np.random.Generator:
+        if self._rng is None:
+            try:
+                info = torch.utils.data.get_worker_info()
+                wid  = info.id if info is not None else 0
+            except Exception:
+                wid = 0
+            self._rng = np.random.default_rng(self._seed + 1009 * wid)
+        return self._rng
+
     def __len__(self) -> int:
         return len(self.fragments)
 
     def __getitem__(self, idx: int):
-        x = torch.from_numpy(self.fragments[idx].astype(np.int64))
+        raw_uint8 = self.fragments[idx]
+        if self.augment and self.gbflip_sigma > 0.0:
+            raw_uint8 = gbflip_uint8(
+                np.ascontiguousarray(raw_uint8, dtype=np.uint8),
+                self.gbflip_sigma, self.gbflip_max_rate, self._get_rng(),
+            )
 
-        if self.augment and self.noise_prob > 0:
-            # Salt-and-pepper byte corruption: random bytes override ~noise_prob
-            # of positions.  Byte values stay in [0, 255].
+        x = torch.from_numpy(raw_uint8.astype(np.int64))
+
+        if self.augment and self.gbflip_sigma == 0.0 and self.noise_prob > 0:
+            # Legacy byte-noise path; only active if GBFlip is off.
             mask  = torch.rand(x.shape) < self.noise_prob
             noise = torch.randint_like(x, 0, 256)
             x     = torch.where(mask, noise, x)

@@ -47,6 +47,12 @@ from hierarchical_cascade import (
     NUM_GROUPS,
     make_optimizer,
 )
+from coarse_losses import (
+    ConfusionWeightedCE,
+    build_label_smoothing_vector,
+    cost_matrix_from_log,
+    cost_matrix_from_array,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -109,12 +115,11 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: str,
     pbar: tqdm,
+    loss_fn,                       # callable(logits, target) -> scalar; e.g. ConfusionWeightedCE
     scaler=None,                  # torch.amp.GradScaler when AMP is enabled, else None
     scheduler=None,               # OneCycleLR; stepped once per optimizer update, not per batch
     grad_clip: float = 1.0,
     accum_steps: int = 1,         # gradient accumulation: effective batch = batch_size * accum_steps
-    label_smoothing: float = 0.0, # >0 prevents over-confident logits; 0.1 matches paper's training regime
-    class_weights=None,           # (NUM_GROUPS,) CE weight tensor; <1 entries down-weight a class
     cutmix_alpha: float = 0.0,    # Beta(alpha, alpha) byte CutMix; 0 disables
     ema_model=None,               # AveragedModel updated after each optimizer step
 ) -> tuple[float, float]:
@@ -156,11 +161,11 @@ def train_one_epoch(
             # the last incomplete accumulation window.
             if lam_eff < 1.0:
                 loss = (
-                    lam_eff       * F.cross_entropy(logits, y,     weight=class_weights, label_smoothing=label_smoothing) +
-                    (1 - lam_eff) * F.cross_entropy(logits, y_mix, weight=class_weights, label_smoothing=label_smoothing)
+                    lam_eff       * loss_fn(logits, y) +
+                    (1 - lam_eff) * loss_fn(logits, y_mix)
                 ) / accum_steps
             else:
-                loss = F.cross_entropy(logits, y, weight=class_weights, label_smoothing=label_smoothing) / accum_steps
+                loss = loss_fn(logits, y) / accum_steps
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -300,24 +305,27 @@ def _epoch_from_path(p: Path) -> int:
 # ---------------------------------------------------------------------------
 
 def train_phase1(
-    train_loader:    DataLoader,
-    val_loader:      DataLoader,
-    epochs:          int,
-    lr:              float,
-    device:          str,
-    archive_dir:     Path,
-    resume:          bool  = False,
-    weight_decay:    float = 0.01,
-    accum_steps:     int   = 1,
-    grad_checkpoint: bool  = False,
-    label_smoothing: float = 0.1,   # prevents over-confident logits; paper trains with smoothing via Mixup
-    warmup_pct:      float = 0.05,  # fraction of steps used for LR warmup; paper uses ~2/50 = 0.04
-    min_lr:          float = 0.0,   # cosine annealing lower bound (eta_min)
-    compile_model:   bool  = False,  # torch.compile: 2-3x throughput on CUDA (PyTorch >= 2.0)
-    class_weights=None,             # (NUM_GROUPS,) CE weight tensor; <1 entries down-weight a class
-    cutmix_alpha:    float = 0.0,   # Beta(alpha, alpha) byte CutMix; 0 disables
-    ema_decay:       float = 0.999, # exponential moving average decay for the weight-averaged model
-    extra_config:    dict  = {},
+    train_loader:        DataLoader,
+    val_loader:          DataLoader,
+    epochs:              int,
+    lr:                  float,
+    device:              str,
+    archive_dir:         Path,
+    resume:              bool  = False,
+    weight_decay:        float = 0.01,
+    accum_steps:         int   = 1,
+    grad_checkpoint:     bool  = False,
+    label_smoothing:     float = 0.1,
+    container_smoothing: float = 0.2,         # heavier eps on disk_image/database
+    warmup_pct:          float = 0.05,
+    min_lr:              float = 0.0,
+    compile_model:       bool  = False,
+    class_weights        = None,              # (NUM_GROUPS,) CE weight tensor
+    confusion_lambda:    float = 0.5,         # off-diagonal penalty weight
+    confusion_source:    Optional[Path] = None,
+    cutmix_alpha:        float = 0.0,
+    ema_decay:           float = 0.999,
+    extra_config:        dict  = {},
 ) -> CoarseClassifier:
 
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -338,6 +346,34 @@ def train_phase1(
 
     if class_weights is not None:
         class_weights = class_weights.to(device)
+
+    # --- Loss: per-class smoothing + off-diagonal confusion penalty ---
+    container_overrides = {
+        GROUP_TO_IDX["disk_image"]: container_smoothing,
+        GROUP_TO_IDX["database"]:   container_smoothing,
+    }
+    smoothing_vec = build_label_smoothing_vector(
+        num_classes       = NUM_GROUPS,
+        default_smoothing = label_smoothing,
+        class_overrides   = container_overrides,
+    )
+    if confusion_source is not None and Path(confusion_source).exists():
+        cost = cost_matrix_from_log(confusion_source, NUM_GROUPS)
+        print(f"Loaded confusion cost matrix from {confusion_source}")
+    else:
+        # Uniform off-diagonal cost when no prior log exists — confusion penalty
+        # is mild but still nudges away from generic-misclass behaviour.
+        cost = cost_matrix_from_array(np.ones((NUM_GROUPS, NUM_GROUPS), np.float32))
+        print("No confusion source given — using uniform off-diagonal cost.")
+
+    loss_fn = ConfusionWeightedCE(
+        cost_matrix      = cost,
+        confusion_lambda = confusion_lambda,
+        class_weights    = class_weights,
+        label_smoothing  = smoothing_vec,
+    ).to(device)
+    print(f"  loss: ConfusionWeightedCE(lambda={confusion_lambda}, "
+          f"label_smoothing={label_smoothing}, container_smoothing={container_smoothing})")
 
     # --- Resume (load before compile so state_dict keys match) ---
     start_epoch = 0
@@ -417,25 +453,29 @@ def train_phase1(
             "session_id":   datetime.now().strftime("%Y%m%d_%H%M%S"),
             "started_at":   datetime.now().isoformat(),
             "config": {
-                "epochs":          epochs,
-                "lr":              lr,
-                "weight_decay":    weight_decay,
-                "betas":           [0.9, 0.999],
-                "label_smoothing": label_smoothing,
-                "warmup_pct":      warmup_pct,
-                "min_lr":          min_lr,
-                "optimizer":       "AdamW",
-                "scheduler":       "LinearWarmup+CosineAnnealing",
-                "amp":             scaler is not None,
-                "compile":         compile_model,
-                "grad_checkpoint": grad_checkpoint,
-                "accum_steps":     accum_steps,
-                "effective_batch": train_loader.batch_size * accum_steps,
-                "device":          device,
-                "batch_size":      train_loader.batch_size,
-                "encoder":         "CoarseEncoder",
-                "cutmix_alpha":    cutmix_alpha,
-                "ema_decay":       ema_decay,
+                "epochs":              epochs,
+                "lr":                  lr,
+                "weight_decay":        weight_decay,
+                "betas":               [0.9, 0.999],
+                "label_smoothing":     label_smoothing,
+                "container_smoothing": container_smoothing,
+                "confusion_lambda":    confusion_lambda,
+                "confusion_source":    str(confusion_source) if confusion_source else None,
+                "warmup_pct":          warmup_pct,
+                "min_lr":              min_lr,
+                "optimizer":           "AdamW",
+                "scheduler":           "LinearWarmup+CosineAnnealing",
+                "loss":                "ConfusionWeightedCE",
+                "amp":                 scaler is not None,
+                "compile":             compile_model,
+                "grad_checkpoint":     grad_checkpoint,
+                "accum_steps":         accum_steps,
+                "effective_batch":     train_loader.batch_size * accum_steps,
+                "device":              device,
+                "batch_size":          train_loader.batch_size,
+                "encoder":             "CoarseEncoder",
+                "cutmix_alpha":        cutmix_alpha,
+                "ema_decay":           ema_decay,
                 **extra_config,
             },
             "status":      "in_progress",
@@ -463,8 +503,8 @@ def train_phase1(
                   bar_format="{l_bar}{bar:30}{r_bar}") as pbar:
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, optimizer, device, pbar,
+                loss_fn=loss_fn,
                 scaler=scaler, scheduler=scheduler, accum_steps=accum_steps,
-                label_smoothing=label_smoothing, class_weights=class_weights,
                 cutmix_alpha=cutmix_alpha, ema_model=ema_model,
             )
 
@@ -601,16 +641,25 @@ if __name__ == "__main__":
     parser.add_argument("--cpu-fraction", type=float, default=None,
                         help="Fraction of CPU cores for PyTorch to use, e.g. 0.5 for 50%% (default: all)")
     parser.add_argument("--noise-prob",   type=float, default=0.02,
-                        help="Fraction of bytes to randomly corrupt per training sample (default: 0.02)")
+                        help="Legacy byte-noise fraction (used only when --gbflip-sigma=0)")
     parser.add_argument("--no-augment",   action="store_true",
-                        help="Disable byte-noise augmentation on the train split")
+                        help="Disable all augmentation on the train split")
+    parser.add_argument("--gbflip-sigma", type=float, default=0.01,
+                        help="GBFlip per-fragment flip rate |N(0, sigma)|; 0 falls back to byte noise (default 0.01)")
+    parser.add_argument("--gbflip-max-rate", type=float, default=0.05,
+                        help="Hard cap on the GBFlip flip rate (default 0.05)")
     parser.add_argument("--cutmix-alpha", type=float, default=0.0,
                         help="Beta-distribution alpha for byte CutMix; 0 disables (default: 0.0)")
     parser.add_argument("--ema-decay",    type=float, default=0.999,
                         help="EMA decay for the weight-averaged model evaluated alongside the raw one (default: 0.999)")
     parser.add_argument("--disk-image-weight", type=float, default=0.6,
-                        help="Cross-entropy weight for the disk_image group; <1 down-weights this "
-                             "container-format class (default: 0.6; 1.0 = no reweighting)")
+                        help="CE weight for the disk_image group (default 0.6; 1.0 = no reweighting)")
+    parser.add_argument("--container-smoothing", type=float, default=0.2,
+                        help="Per-class label smoothing for disk_image/database (default 0.2)")
+    parser.add_argument("--confusion-lambda",  type=float, default=0.5,
+                        help="Off-diagonal confusion penalty weight (0 disables; default 0.5)")
+    parser.add_argument("--confusion-source",  type=Path, default=None,
+                        help="Prior training_log.json to seed the confusion-cost matrix")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -652,10 +701,15 @@ if __name__ == "__main__":
         )
         print(f"  {len(val_labels)} fragments, {len(set(val_labels))} classes")
 
-        train_ds = LazyFragmentDataset(train_frag_path, sector, train_indices, train_labels,
-                                       mode="coarse", augment=not args.no_augment,
-                                       noise_prob=args.noise_prob)
-        val_ds   = LazyFragmentDataset(val_frag_path,   sector, val_indices,   val_labels,
+        train_ds = LazyFragmentDataset(
+            train_frag_path, sector, train_indices, train_labels,
+            mode            = "coarse",
+            augment         = not args.no_augment,
+            noise_prob      = args.noise_prob,
+            gbflip_sigma    = args.gbflip_sigma,
+            gbflip_max_rate = args.gbflip_max_rate,
+        )
+        val_ds   = LazyFragmentDataset(val_frag_path, sector, val_indices, val_labels,
                                        mode="coarse", augment=False)
 
     else:
@@ -671,9 +725,15 @@ if __name__ == "__main__":
         )
         print(f"  {len(val_labels)} fragments, {len(set(val_labels))} classes")
 
-        train_ds = FragmentDataset(train_frags, train_labels, mode="coarse",
-                                   augment=not args.no_augment, noise_prob=args.noise_prob)
-        val_ds   = FragmentDataset(val_frags,   val_labels,   mode="coarse", augment=False)
+        train_ds = FragmentDataset(
+            train_frags, train_labels,
+            mode            = "coarse",
+            augment         = not args.no_augment,
+            noise_prob      = args.noise_prob,
+            gbflip_sigma    = args.gbflip_sigma,
+            gbflip_max_rate = args.gbflip_max_rate,
+        )
+        val_ds   = FragmentDataset(val_frags, val_labels, mode="coarse", augment=False)
 
     on_cuda = device.startswith("cuda")
     # persistent_workers: keeps worker processes alive between epochs, avoiding the
@@ -701,23 +761,26 @@ if __name__ == "__main__":
     print(f"  cross-entropy class weights: disk_image={args.disk_image_weight}, others=1.0")
 
     train_phase1(
-        train_loader     = train_loader,
-        val_loader       = val_loader,
-        epochs           = args.epochs,
-        lr               = args.lr,
-        weight_decay     = args.weight_decay,
-        label_smoothing  = args.label_smoothing,
-        warmup_pct       = args.warmup_pct,
-        min_lr           = args.min_lr,
-        compile_model    = args.compile,
-        accum_steps      = args.grad_accum,
-        grad_checkpoint  = args.grad_checkpoint,
-        class_weights    = class_weights,
-        cutmix_alpha     = args.cutmix_alpha,
-        ema_decay        = args.ema_decay,
-        device           = device,
-        archive_dir      = args.archive_dir,
-        resume           = args.resume,
+        train_loader        = train_loader,
+        val_loader          = val_loader,
+        epochs              = args.epochs,
+        lr                  = args.lr,
+        weight_decay        = args.weight_decay,
+        label_smoothing     = args.label_smoothing,
+        container_smoothing = args.container_smoothing,
+        confusion_lambda    = args.confusion_lambda,
+        confusion_source    = args.confusion_source,
+        warmup_pct          = args.warmup_pct,
+        min_lr              = args.min_lr,
+        compile_model       = args.compile,
+        accum_steps         = args.grad_accum,
+        grad_checkpoint     = args.grad_checkpoint,
+        class_weights       = class_weights,
+        cutmix_alpha        = args.cutmix_alpha,
+        ema_decay           = args.ema_decay,
+        device              = device,
+        archive_dir         = args.archive_dir,
+        resume              = args.resume,
         extra_config = {
             "max_per_class":      args.max_per_class,
             "fraction":           args.fraction,
@@ -727,6 +790,8 @@ if __name__ == "__main__":
             "cpu_fraction":       args.cpu_fraction,
             "augment":            not args.no_augment,
             "noise_prob":         args.noise_prob,
+            "gbflip_sigma":       args.gbflip_sigma,
+            "gbflip_max_rate":    args.gbflip_max_rate,
             "disk_image_weight":  args.disk_image_weight,
         },
     )

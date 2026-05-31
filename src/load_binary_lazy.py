@@ -15,7 +15,7 @@ from typing import Optional
 
 from load_binary import BINARY_DIR, label_indices_to_strings
 from hierarchical_cascade import (
-    TYPE_TO_GROUP, GROUP_TO_IDX, GROUP_LOCAL_IDX, GROUPS,
+    TYPE_TO_GROUP, GROUP_TO_IDX, GROUP_LOCAL_IDX, GROUPS, gbflip_uint8,
 )
 
 
@@ -40,23 +40,30 @@ class LazyFragmentDataset(Dataset):
 
     def __init__(
         self,
-        frag_path: Path,
-        sector_size: int,
-        file_indices: np.ndarray,
-        labels: list[str],
-        mode: str = "coarse",
-        augment: bool = False,
-        noise_prob: float = 0.02,
+        frag_path:       Path,
+        sector_size:     int,
+        file_indices:    np.ndarray,
+        labels:          list[str],
+        mode:            str   = "coarse",
+        augment:         bool  = False,
+        noise_prob:      float = 0.02,
+        gbflip_sigma:    float = 0.0,
+        gbflip_max_rate: float = 0.05,
+        seed:            int   = 0,
     ):
         assert mode == "coarse" or mode.startswith("specialist:")
         assert len(file_indices) == len(labels)
 
-        self.frag_path   = Path(frag_path)
-        self.sector_size = sector_size
-        self.mode        = mode
-        self.augment     = augment
-        self.noise_prob  = noise_prob
-        self._fh         = None     # opened lazily per worker
+        self.frag_path       = Path(frag_path)
+        self.sector_size     = sector_size
+        self.mode            = mode
+        self.augment         = augment
+        self.noise_prob      = noise_prob
+        self.gbflip_sigma    = float(gbflip_sigma)
+        self.gbflip_max_rate = float(gbflip_max_rate)
+        self._seed           = int(seed)
+        self._rng            = None
+        self._fh             = None     # opened lazily per worker
 
         target_group = mode.split(":")[1] if ":" in mode else None
 
@@ -73,6 +80,16 @@ class LazyFragmentDataset(Dataset):
             self.labels       = list(labels)
             self.label_map    = GROUP_TO_IDX
 
+    def _get_rng(self) -> np.random.Generator:
+        if self._rng is None:
+            try:
+                info = torch.utils.data.get_worker_info()
+                wid  = info.id if info is not None else 0
+            except Exception:
+                wid = 0
+            self._rng = np.random.default_rng(self._seed + 1009 * wid)
+        return self._rng
+
     def __len__(self) -> int:
         return len(self.file_indices)
 
@@ -81,12 +98,17 @@ class LazyFragmentDataset(Dataset):
             self._fh = open(self.frag_path, "rb")
         self._fh.seek(int(self.file_indices[idx]) * self.sector_size)
         raw = self._fh.read(self.sector_size)
-        x = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(torch.int64)
 
-        if self.augment and self.noise_prob > 0:
-            # Salt-and-pepper byte corruption: random bytes override ~noise_prob
-            # of positions.  Re-rolled every fetch, so each epoch sees a slightly
-            # different corrupted form of the same fragment.
+        if self.augment and self.gbflip_sigma > 0.0:
+            raw_arr = np.frombuffer(raw, dtype=np.uint8).copy()
+            raw_arr = gbflip_uint8(
+                raw_arr, self.gbflip_sigma, self.gbflip_max_rate, self._get_rng(),
+            )
+            x = torch.from_numpy(raw_arr.astype(np.int64))
+        else:
+            x = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(torch.int64)
+
+        if self.augment and self.gbflip_sigma == 0.0 and self.noise_prob > 0:
             mask  = torch.rand(x.shape) < self.noise_prob
             noise = torch.randint_like(x, 0, 256)
             x     = torch.where(mask, noise, x)
@@ -103,6 +125,7 @@ class LazyFragmentDataset(Dataset):
         """Drop the file handle before pickling so DataLoader workers are safe."""
         state = self.__dict__.copy()
         state["_fh"] = None
+        state["_rng"] = None    # workers re-seed lazily based on worker id
         return state
 
 
